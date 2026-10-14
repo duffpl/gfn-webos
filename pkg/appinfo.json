@@ -1,0 +1,15 @@
+{
+  "id": "io.github.gfnwebos",
+  "version": "0.1.0",
+  "vendor": "gfn-webos",
+  "type": "native",
+  "main": "gfn-app",
+  "title": "GFN webOS (dev)",
+  "appDescription": "Unofficial GeForce NOW client - not affiliated with NVIDIA",
+  "icon": "icon.png",
+  "iconColor": "#76b900",
+  "nativeLifeCycleInterfaceVersion": 2,
+  "handlesRelaunch": false,
+  "transparent": true,
+  "requiredMemory": 160
+}

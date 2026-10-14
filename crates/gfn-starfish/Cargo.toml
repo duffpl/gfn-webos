@@ -1,0 +1,13 @@
+[package]
+name = "gfn-starfish"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Low-latency elementary-stream video output through LG StarfishMediaAPIs"
+
+[dependencies]
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"

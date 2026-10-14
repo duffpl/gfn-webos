@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# The NDK compiler's built-in sysroot is the CI runner path it was built on; supply ours. Like
+# arm-webos-gcc, build for the TV's real core rather than the cc crate's default -march=armv6.
+sdk="${WEBOS_SDK:-$HOME/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot}"
+args=()
+for arg in "$@"; do
+    [[ "$arg" == -march=* || "$arg" == -mcpu=* || "$arg" == -mfloat-abi=* || "$arg" == -mfpu=* ]] || args+=("$arg")
+done
+exec "$sdk/bin/arm-webos-linux-gnueabi-g++" --sysroot="$sdk/arm-webos-linux-gnueabi/sysroot" "${args[@]}" -march=armv7-a -mcpu=cortex-a9 -mfloat-abi=softfp -mfpu=neon-fp16

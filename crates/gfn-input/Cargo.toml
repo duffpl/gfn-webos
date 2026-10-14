@@ -1,0 +1,13 @@
+[package]
+name = "gfn-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SDL keyboard, mouse and controller events to NVST captured input"
+
+[dependencies]
+gfn-sdl = { path = "../gfn-sdl" }
+libc = "0.2"
+opennow-streamer-platform-webos = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-platform-webos" }
+opennow-streamer-protocol = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-protocol" }

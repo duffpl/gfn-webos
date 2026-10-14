@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# NDK gcc with our sysroot (its built-in one is the CI runner path it was built on). When linking an
+# executable it also appends libgfncompat.a: glibc 2.12 lacks getauxval (Rust std's startup) and
+# getentropy (aws-lc's seed). As an archive it only resolves what is still undefined, so it never shadows a definition.
+set -euo pipefail
+sdk="${WEBOS_SDK:-$HOME/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+gcc=("$sdk/bin/arm-webos-linux-gnueabi-gcc" --sysroot="$sdk/arm-webos-linux-gnueabi/sysroot")
+
+# The cc crate passes -march=armv6 for this target, which beats -mcpu: atomics then compile to CP15
+# barriers (mcr p15, c7, c10, 5) that SIGILL on the TV. Every C object is built for the real core.
+# Its -mfloat-abi=soft likewise turns every float op into a libgcc call (Opus decode alone cost a
+# quarter of a core); softfp + NEON is the SDK's own default and keeps the soft calling convention
+# Rust's arm-unknown-linux-gnueabi objects use, so both still link together.
+args=()
+for arg in "$@"; do
+    [[ "$arg" == -march=* || "$arg" == -mcpu=* || "$arg" == -mfloat-abi=* || "$arg" == -mfpu=* ]] || args+=("$arg")
+done
+set -- "${args[@]}" -march=armv7-a -mcpu=cortex-a9 -mfloat-abi=softfp -mfpu=neon-fp16
+
+linking_executable=1
+has_output=0
+for arg in "$@"; do
+    case "$arg" in
+        -c|-S|-E|-shared|-r) linking_executable=0 ;;
+        -o) has_output=1 ;;
+    esac
+done
+if [[ $linking_executable == 0 || $has_output == 0 ]]; then
+    exec "${gcc[@]}" "$@"
+fi
+
+compat="$root/target/compat/libgfncompat.a"
+sources=("$root"/native/compat/*.c)
+stale=0
+[[ -f "$compat" ]] || stale=1
+for src in "${sources[@]}" "${BASH_SOURCE[0]}"; do
+    [[ "$src" -nt "$compat" ]] && stale=1
+done
+if [[ $stale == 1 ]]; then
+    mkdir -p "$(dirname "$compat")"
+    work="$(mktemp -d "${compat%.a}.XXXXXX")"
+    for src in "${sources[@]}"; do
+        "${gcc[@]}" -mcpu=cortex-a9 -O2 -fPIC -D_GNU_SOURCE -std=gnu11 -c "$src" -o "$work/$(basename "${src%.c}").o"
+    done
+    rm -f "$compat.tmp"
+    "$sdk/bin/arm-webos-linux-gnueabi-ar" rcs "$compat.tmp" "$work"/*.o
+    rm -rf "$work"
+    mv "$compat.tmp" "$compat"
+fi
+exec "${gcc[@]}" "$@" "$compat"

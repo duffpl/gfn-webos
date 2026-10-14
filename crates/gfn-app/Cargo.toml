@@ -1,0 +1,28 @@
+[package]
+name = "gfn-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "GeForce NOW client for LG webOS: sign-in, library, launch and stream"
+
+[features]
+# Desktop simulator: the picture is decoded on the host and drawn into the window instead of the
+# TV's Starfish plane.
+sim = ["gfn-sink/sim-video"]
+
+[dependencies]
+ctrlc = "3"
+fontdue = "0.9"
+gfn-core-client = { path = "../gfn-core-client" }
+gfn-input = { path = "../gfn-input" }
+gfn-luna = { path = "../gfn-luna" }
+gfn-sdl = { path = "../gfn-sdl" }
+gfn-sink = { path = "../gfn-sink" }
+gfn-starfish = { path = "../gfn-starfish" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libc = "0.2"
+opennow-streamer-core = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-core", default-features = false, features = ["webos-platform"] }
+opennow-streamer-protocol = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-protocol" }
+qrcodegen = "1.8"
+serde_json = "1"

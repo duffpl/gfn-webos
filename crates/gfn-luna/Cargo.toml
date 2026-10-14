@@ -1,0 +1,13 @@
+[package]
+name = "gfn-luna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Calls to webOS system services over the luna-service2 bus"
+
+[dependencies]
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"

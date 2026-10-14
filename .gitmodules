@@ -1,0 +1,4 @@
+[submodule "vendor/OpenNOW"]
+	path = vendor/OpenNOW
+	url = https://github.com/duffpl/OpenNOW.git
+	branch = webos

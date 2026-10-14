@@ -1,0 +1,10 @@
+[package]
+name = "gfn-core-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Client for the opennow-core stdio JSON protocol (docs/core-protocol.md)"
+
+[dependencies]
+serde_json = "1"

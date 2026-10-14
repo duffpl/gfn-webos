@@ -1,0 +1,22 @@
+[package]
+name = "gfn-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MediaBackend for the NVST engine: bounded video/audio pipelines over pluggable decoders"
+
+[features]
+# OpenH264 software decode presented in an SDL window: the desktop simulator's picture.
+sim-video = ["dep:openh264"]
+
+[dependencies]
+gfn-sdl = { path = "../gfn-sdl" }
+opennow-streamer-platform-webos = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-platform-webos" }
+opennow-streamer-protocol = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-protocol" }
+opus = "0.3.1"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
+openh264 = { version = "0.9.8", default-features = false, features = ["source"], optional = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "arm"))'.dependencies]
+gfn-starfish = { path = "../gfn-starfish" }

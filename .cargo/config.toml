@@ -1,0 +1,17 @@
+# Bound to the target so an IDE or a hand-typed cargo build gets the same codegen as scripts/webos-env.sh.
+#   target-cpu=cortex-a9    the default ARMv6 codegen emits CP15 barriers that SIGILL on newer TV SoCs.
+#   target-feature=-neon    some transitive crates' NEON paths need unstable intrinsics.
+#   force-frame-pointers    lets an ARM crash walker follow the r11 chain.
+#   getrandom linux_raw    getrandom 0.3+ looks up glibc's getrandom() (2.25+; the TV has 2.24) and
+#                           otherwise reads /dev/random, which the app jail lacks: rand panics at
+#                           start-up. The raw syscall exists on every supported kernel (>= 3.17).
+#   export-dynamic-symbol   libplayerAPIs reaches callbackFunctionHook through its PLT; the interposer
+#                           in native/starfish.c must be exported from the executable to preempt it.
+[target.arm-unknown-linux-gnueabi]
+rustflags = [
+    "-C", "target-cpu=cortex-a9",
+    "-C", "target-feature=-neon",
+    "-C", "force-frame-pointers=yes",
+    "--cfg", "getrandom_backend=\"linux_raw\"",
+    "-C", "link-arg=-Wl,--export-dynamic-symbol=_ZN17StarfishMediaAPIs20callbackFunctionHookEixPKc",
+]

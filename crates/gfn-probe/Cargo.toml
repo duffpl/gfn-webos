@@ -1,0 +1,13 @@
+[package]
+name = "gfn-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "On-device probes for the webOS GeForce NOW client"
+
+[dependencies]
+gfn-core-client = { path = "../gfn-core-client" }
+gfn-sdl = { path = "../gfn-sdl" }
+gfn-starfish = { path = "../gfn-starfish" }
+serde_json = "1"

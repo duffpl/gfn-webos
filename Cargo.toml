@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/*"]
+# The OpenNOW submodule's crates belong to its own workspaces.
+exclude = ["vendor"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[patch.crates-io]
+# Same vendored Opus sources OpenNOW ships, compiled statically for both the TV and the simulator.
+audiopus_sys = { path = "vendor/OpenNOW/native/opennow-streamer/vendor/audiopus-sys" }
+
+# The simulator decodes 1080p60 in software (OpenH264); unoptimised it cannot keep up, the queue
+# overflows and the stream stutters on every keyframe recovery. Keep our own crates debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+# Our own per-frame paths (NAL scanning, plane copies) are just as hot as the decoder.
+[profile.dev.package.gfn-sink]
+opt-level = 3
