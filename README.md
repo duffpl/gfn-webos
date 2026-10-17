@@ -73,6 +73,12 @@ This repository adds the TV side:
 - The stream menu: stats, the keyboard, and ending the session.
 - Recovery when another app takes the screen: the decoder is reopened when you return.
 
+**Updates**
+- The version, commit and its date at the bottom of Settings.
+- A check for newer releases on GitHub at start and twice a day. When there is one, an arrow
+  leads the library header; it opens the release notes and a QR code to the release page.
+  The app doesn't install anything itself.
+
 **Input**
 - Bluetooth controller pairing (Controllers screen). Paired pads are read directly from
   `/dev/input`.
@@ -124,6 +130,7 @@ Known problem: over Wi-Fi the stream stutters about every half-second. The netwo
 - Hiding the idle Magic Remote pointer.
 - Keeping the TV awake while a controller is used in the menus.
 - Sign-out, and the new header icons.
+- The release check, the update arrow and the release notes window.
 - AV1. The C9 can't decode it, so it needs a 2020 or newer LG TV. The app doesn't check which
   codecs the TV supports: if a stream won't start, choose another codec.
 
@@ -151,7 +158,8 @@ The OpenNOW core can do these, but this app doesn't offer them yet:
 - **Microphone and voice chat.**
 - **Your account:** subscription details and play-time information.
 - **Support:** exporting diagnostics, sending feedback, Discord presence.
-- **Updates:** there is no updater; new versions are installed by hand.
+- **Updates:** the app says when a new release is out but doesn't install it; new versions are
+  installed by hand.
 - **Languages:** English only. OpenNOW is translated through Crowdin.
 
 ## Getting the app

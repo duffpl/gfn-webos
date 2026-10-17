@@ -20,6 +20,7 @@ mod bluetooth;
 mod crash;
 mod gfx;
 mod qr;
+mod release;
 mod screensaver;
 mod session;
 mod settings;
@@ -47,6 +48,8 @@ pub enum Update {
     Account(account::Progress),
     Art { url: String, pixels: Option<art::Pixels> },
     Bluetooth(bluetooth::Snapshot),
+    /// Published releases newer than this build, newest first.
+    Releases(Vec<release::Release>),
     Session(session::Progress),
 }
 
@@ -180,6 +183,7 @@ fn main() {
 
 fn run(args: &[String]) -> Result<(), String> {
     let config = config(args)?;
+    println!("gfn-webos {} {} {}", release::VERSION, release::COMMIT, release::COMMIT_DATE);
     println!("data directory: {}", config.data_dir.display());
     let settings_path = settings::StreamSettings::path(&config.data_dir);
     let stream_settings = stream_settings(args, &settings_path)?;
@@ -229,7 +233,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let (art_tx, art_rx) = channel();
     let preview = flag(args, "--preview");
     match preview {
-        None => account::start(config, art_rx, art_tx.clone(), updates_tx.clone(), Arc::clone(&quit)),
+        None => {
+            account::start(config, art_rx, art_tx.clone(), updates_tx.clone(), Arc::clone(&quit));
+            release::start(updates_tx.clone());
+        }
         Some(_) => art::spawn_files(art_rx, updates_tx.clone()),
     }
     let bluetooth = bluetooth::start(updates_tx.clone());

@@ -31,7 +31,7 @@ const VIEWER_THUMBS: usize = 7;
 const VIEWER_STRIP_Y: f32 = 884.0;
 /// Laid over the picture under the text, so the text reads whatever the picture is.
 const SHADE: Rgba = [14, 15, 18, 235];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+pub(super) const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -184,7 +184,7 @@ fn date_days(iso: &str) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
-fn date_parts(iso: &str) -> Option<(i64, u32, u32)> {
+pub(super) fn date_parts(iso: &str) -> Option<(i64, u32, u32)> {
     let date = iso.get(..10)?;
     let mut parts = date.split('-');
     let year = parts.next()?.parse().ok()?;

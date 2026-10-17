@@ -149,6 +149,7 @@ pub struct Painter {
 pub enum Icon {
     Cog,
     Controller,
+    Update,
 }
 
 impl Icon {
@@ -156,6 +157,7 @@ impl Icon {
         match self {
             Icon::Cog => include_bytes!("../../../assets/icons/cog.svg"),
             Icon::Controller => include_bytes!("../../../assets/icons/controller.svg"),
+            Icon::Update => include_bytes!("../../../assets/icons/arrow-up.svg"),
         }
     }
 }

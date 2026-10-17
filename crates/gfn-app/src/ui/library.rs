@@ -26,12 +26,15 @@ const ART_MARGIN_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Header {
+    /// Only while a newer release is published.
+    Update,
     Settings,
     Controllers,
     Account,
 }
 
-const HEADER_BUTTONS: [Header; 3] = [Header::Settings, Header::Controllers, Header::Account];
+const HEADER: [Header; 3] = [Header::Settings, Header::Controllers, Header::Account];
+const HEADER_WITH_UPDATE: [Header; 4] = [Header::Update, Header::Settings, Header::Controllers, Header::Account];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -95,6 +98,8 @@ pub(super) struct Library {
     prefs: PathBuf,
     /// The game detail screen, over the grid.
     pub(super) detail: Option<Detail>,
+    /// A newer release is published, so the header leads with its button.
+    update: bool,
 }
 
 impl Library {
@@ -117,6 +122,22 @@ impl Library {
             on_screen: HashSet::new(),
             prefs,
             detail: None,
+            update: false,
+        }
+    }
+
+    pub(super) fn header(&self) -> &'static [Header] {
+        if self.update { &HEADER_WITH_UPDATE } else { &HEADER }
+    }
+
+    /// Keeps a focused header button focused as the update button comes or goes before it.
+    pub(super) fn set_update(&mut self, update: bool) {
+        if update == self.update {
+            return;
+        }
+        self.update = update;
+        if let Focus::Header(index) = self.focus {
+            self.focus = Focus::Header(if update { index + 1 } else { index.saturating_sub(1) });
         }
     }
 
@@ -217,9 +238,9 @@ impl Library {
         match self.focus {
             Focus::Header(index) => match nav {
                 Nav::Left => self.focus = Focus::Header(index.saturating_sub(1)),
-                Nav::Right => self.focus = Focus::Header((index + 1).min(HEADER_BUTTONS.len() - 1)),
+                Nav::Right => self.focus = Focus::Header((index + 1).min(self.header().len() - 1)),
                 Nav::Down => self.focus = Focus::Toolbar(0),
-                Nav::Select => return Outcome::Open(HEADER_BUTTONS[index]),
+                Nav::Select => return Outcome::Open(self.header()[index]),
                 Nav::Back => return Outcome::Exit,
                 Nav::Up => {}
             },
@@ -420,7 +441,9 @@ impl App {
     /// Left to right, ending with the user's name.
     fn header_buttons(&self) -> Vec<(Rect, String, Header)> {
         let mut right = CANVAS_W - MARGIN;
-        let mut buttons: Vec<_> = HEADER_BUTTONS
+        let mut buttons: Vec<_> = self
+            .library
+            .header()
             .iter()
             .rev()
             .map(|&button| {
@@ -495,6 +518,7 @@ impl App {
             }
             Header::Controllers => self.open_controllers(),
             Header::Account => self.menu = Some(sign_out_menu(&self.user)),
+            Header::Update => self.open_notes(),
         }
         self.dirty = true;
     }
@@ -610,8 +634,9 @@ impl App {
         for (index, (rect, label, kind)) in header.into_iter().enumerate() {
             let focused = self.library.focus == Focus::Header(index) && !menu_open;
             match kind {
-                Header::Settings => icon_button(p, window, rect, Icon::Cog, &label, focused),
-                Header::Controllers => icon_button(p, window, rect, Icon::Controller, &label, focused),
+                Header::Update => icon_button(p, window, rect, Icon::Update, &label, focused, ACCENT),
+                Header::Settings => icon_button(p, window, rect, Icon::Cog, &label, focused, TEXT),
+                Header::Controllers => icon_button(p, window, rect, Icon::Controller, &label, focused, TEXT),
                 Header::Account => button(p, window, rect, &label, focused),
             }
         }
@@ -768,16 +793,17 @@ pub(super) fn button(p: &mut Painter, window: &mut Window, rect: Rect, label: &s
     p.text(window, label, rect.x + rect.w / 2.0, rect.y + 14.0, 28.0, color, true, Align::Center);
 }
 
-/// A round button showing `icon`, widened to a pill when it has a `label` beside the icon.
-fn icon_button(p: &mut Painter, window: &mut Window, rect: Rect, icon: Icon, label: &str, focused: bool) {
+/// A round button showing `icon`, in `color` until focused, widened to a pill when it has a
+/// `label` beside the icon.
+fn icon_button(p: &mut Painter, window: &mut Window, rect: Rect, icon: Icon, label: &str, focused: bool, color: Rgba) {
     if focused {
         p.halo(window, rect, 30.0, 4.0, ACCENT);
     }
     p.round_rect(window, rect, 30.0, if focused { ACCENT } else { BUTTON });
-    let color = if focused { ON_ACCENT } else { TEXT };
-    p.icon(window, icon, rect.x + 30.0, rect.y + rect.h / 2.0, 32.0, color);
+    let (icon_color, text_color) = if focused { (ON_ACCENT, ON_ACCENT) } else { (color, TEXT) };
+    p.icon(window, icon, rect.x + 30.0, rect.y + rect.h / 2.0, 32.0, icon_color);
     if !label.is_empty() {
-        p.text(window, label, rect.x + 56.0, rect.y + 14.0, 28.0, color, true, Align::Left);
+        p.text(window, label, rect.x + 56.0, rect.y + 14.0, 28.0, text_color, true, Align::Left);
     }
 }
 

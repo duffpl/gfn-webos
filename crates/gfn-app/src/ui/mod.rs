@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::account::{self, Game};
 use crate::art;
 use crate::bluetooth::{self, Command, Status};
+use crate::release::Release;
 use crate::gfx::{Align, CANVAS_H, CANVAS_W, Icon, Painter, Rect, Rgba};
 use crate::session::{self, Profile, Stats, Takeover};
 use crate::settings::{self, StreamSettings};
@@ -24,8 +25,10 @@ use crate::{TV, Update, Updates};
 
 mod detail;
 mod library;
+mod update;
 
 use library::{Art, Library};
+use update::Notes;
 
 const BACKGROUND: Rgba = [14, 15, 18, 255];
 const PANEL: Rgba = [30, 32, 38, 255];
@@ -162,6 +165,10 @@ pub struct App {
     keyboard: Option<Keyboard>,
     /// A short message over the stream, until the instant.
     notice: Option<(String, Instant)>,
+    /// Published releases newer than this build, newest first.
+    releases: Vec<Release>,
+    /// Their notes, open over the library.
+    notes: Option<Notes>,
     last_render: Instant,
     dirty: bool,
     quitting: bool,
@@ -209,6 +216,8 @@ impl App {
             stats: None,
             keyboard: None,
             notice: None,
+            releases: Vec::new(),
+            notes: None,
             last_render: Instant::now(),
             dirty: true,
             quitting: false,
@@ -282,9 +291,11 @@ impl App {
             "genres" => self.preview_library(true),
             "detail" => self.preview_detail(false),
             "viewer" => self.preview_detail(true),
+            "update" => self.preview_update(false),
+            "notes" => self.preview_update(true),
             other => {
                 return Err(format!(
-                    "--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings, library, genres, detail, viewer"
+                    "--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings, library, genres, detail, viewer, update, notes"
                 ));
             }
         }
@@ -359,6 +370,13 @@ impl App {
             },
             Update::Session(progress) => self.session_progress(progress, input),
             Update::Bluetooth(snapshot) => self.controllers = snapshot,
+            Update::Releases(releases) => {
+                self.library.set_update(!releases.is_empty());
+                if releases.is_empty() {
+                    self.notes = None;
+                }
+                self.releases = releases;
+            }
         }
     }
 
@@ -549,7 +567,7 @@ impl App {
             }
             return;
         }
-        if matches!(self.screen, Screen::Library) && self.menu.is_none() {
+        if matches!(self.screen, Screen::Library) && self.menu.is_none() && self.notes.is_none() {
             if self.keyboard.is_some() {
                 self.library_typing(event);
                 return;
@@ -649,6 +667,10 @@ impl App {
             }
             return;
         }
+        if self.notes.is_some() {
+            self.notes_nav(nav);
+            return;
+        }
         match &self.screen {
             Screen::Library => self.library_nav(nav),
             Screen::Controllers => self.controllers_nav(nav),
@@ -738,6 +760,9 @@ impl App {
             }
             return;
         }
+        if self.notes.is_some() {
+            return;
+        }
         if matches!(self.screen, Screen::Library) {
             self.library_hover();
         }
@@ -765,6 +790,10 @@ impl App {
                 let action = menu.items[index].1.clone();
                 self.act(action);
             }
+            return;
+        }
+        if self.notes.is_some() {
+            self.notes_click();
             return;
         }
         if matches!(self.screen, Screen::Library) {
@@ -832,6 +861,7 @@ impl App {
         if self.stats_visible && self.is_streaming() {
             self.draw_stats(window);
         }
+        self.draw_notes(window);
         self.draw_menu(window);
         if shoot {
             self.save_screenshot(window);
@@ -1389,6 +1419,12 @@ impl App {
         let help_y = settings_row_rect(SettingRow::ALL.len()).y + 20.0;
         let used = p.paragraph(window, SettingRow::ALL[focus].help(), Rect::new(MARGIN, help_y, SETTINGS_W, 200.0), 28.0, DIM, Align::Left);
         p.text(window, "Changes apply to the next game you start.", MARGIN, help_y + used + 30.0, 28.0, TEXT, false, Align::Left);
+        let version = update::version_text();
+        p.text(window, &version, MARGIN, 1020.0, 26.0, DIM, false, Align::Left);
+        if let Some(newest) = self.releases.first() {
+            let x = MARGIN + p.text_width(&version, 26.0, false);
+            p.text(window, &format!("  ·  {} is available", newest.version), x, 1020.0, 26.0, ACCENT, false, Align::Left);
+        }
     }
 }
 
