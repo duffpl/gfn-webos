@@ -22,6 +22,7 @@ use crate::session::{self, Profile, Stats, Takeover};
 use crate::settings::{self, StreamSettings};
 use crate::{TV, Update, Updates};
 
+mod detail;
 mod library;
 
 use library::{Art, Library};
@@ -272,9 +273,11 @@ impl App {
             "settings" => self.screen = Screen::Settings,
             "library" => self.preview_library(false),
             "genres" => self.preview_library(true),
+            "detail" => self.preview_detail(false),
+            "viewer" => self.preview_detail(true),
             other => {
                 return Err(format!(
-                    "--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings, library, genres"
+                    "--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings, library, genres, detail, viewer"
                 ));
             }
         }
@@ -342,7 +345,9 @@ impl App {
                     self.library.pending.insert(url, pixels);
                 }
                 None => {
-                    self.library.art.insert(url, Art::Missing);
+                    if let Some(art @ Art::Requested) = self.library.art.get_mut(&url) {
+                        *art = Art::Missing;
+                    }
                 }
             },
             Update::Session(progress) => self.session_progress(progress, input),

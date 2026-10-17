@@ -2,11 +2,12 @@
 
 use serde_json::json;
 
+use super::detail::Detail;
 use super::*;
 
 const COLUMNS: usize = 6;
-const TILE_W: f32 = 240.0;
-const TILE_H: f32 = 320.0;
+pub(super) const TILE_W: f32 = 240.0;
+pub(super) const TILE_H: f32 = 320.0;
 const TILE_RADIUS: f32 = 12.0;
 const ROW_H: f32 = TILE_H + 84.0;
 const TOOLBAR_Y: f32 = 150.0;
@@ -59,7 +60,7 @@ enum Sort {
 enum Outcome {
     Nothing,
     /// The game at this position in `Library::games`.
-    Launch(usize),
+    Details(usize),
     Open(Header),
     Type,
     Exit,
@@ -91,6 +92,8 @@ pub(super) struct Library {
     on_screen: HashSet<String>,
     /// Where the sort order is kept between launches.
     prefs: PathBuf,
+    /// The game detail screen, over the grid.
+    pub(super) detail: Option<Detail>,
 }
 
 impl Library {
@@ -112,11 +115,13 @@ impl Library {
             pending: HashMap::new(),
             on_screen: HashSet::new(),
             prefs,
+            detail: None,
         }
     }
 
     pub(super) fn set_games(&mut self, games: Vec<Game>) {
         self.games = games;
+        self.detail = None;
         self.view.clear();
         self.refresh();
     }
@@ -145,7 +150,7 @@ impl Library {
         }
     }
 
-    fn genre_label(&self, code: &str) -> String {
+    pub(super) fn genre_label(&self, code: &str) -> String {
         self.genre_names.get(code).cloned().unwrap_or_else(|| title_case(code))
     }
 
@@ -157,8 +162,12 @@ impl Library {
         rows
     }
 
-    /// The game a Play press starts: the selected tile, while the grid has focus.
+    /// The game a Play press starts: the one whose details are open, or the selected tile while
+    /// the grid has focus.
     fn play(&self) -> Option<usize> {
+        if let Some(detail) = &self.detail {
+            return Some(detail.game);
+        }
         if self.focus != Focus::Grid || self.genre_menu.is_some() {
             return None;
         }
@@ -233,7 +242,7 @@ impl Library {
                     Nav::Down if *selected + COLUMNS < count => *selected += COLUMNS,
                     // The last row may be short: moving down from above it lands on its last tile.
                     Nav::Down if *selected / COLUMNS + 1 < count.div_ceil(COLUMNS) => *selected = count - 1,
-                    Nav::Select => return self.play().map_or(Outcome::Nothing, Outcome::Launch),
+                    Nav::Select => return self.play().map_or(Outcome::Nothing, Outcome::Details),
                     Nav::Back => return Outcome::Exit,
                     _ => {}
                 }
@@ -250,7 +259,7 @@ impl Library {
             return "Up/Down  Move     OK  Apply     Back  Close";
         }
         match self.focus {
-            Focus::Grid => "OK  Play     Back  Exit",
+            Focus::Grid => "OK  Details     Green  Play     Back  Exit",
             Focus::Header(_) => "OK  Open     Back  Exit",
             Focus::Toolbar(index) => match TOOLS[index] {
                 Tool::Search if self.query.is_empty() => "OK  Search     Back  Exit",
@@ -321,7 +330,7 @@ fn genre_counts(games: &[Game]) -> Vec<(String, usize)> {
 }
 
 /// A readable name for a genre code NVIDIA gave no label for: `FIGHTING_GAME` reads "Fighting Game".
-fn title_case(code: &str) -> String {
+pub(super) fn title_case(code: &str) -> String {
     code.split(['_', ' '])
         .filter(|word| !word.is_empty())
         .map(|word| {
@@ -343,9 +352,13 @@ struct GenreRow {
 
 impl App {
     pub(super) fn library_nav(&mut self, nav: Nav) {
+        if self.library.detail.is_some() {
+            self.detail_nav(nav);
+            return;
+        }
         match self.library.nav(nav) {
             Outcome::Nothing => {}
-            Outcome::Launch(index) => self.launch_library_game(index),
+            Outcome::Details(index) => self.open_detail(index),
             Outcome::Open(button) => self.open_header(button),
             Outcome::Type => self.open_keyboard(),
             Outcome::Exit => self.menu = Some(exit_menu()),
@@ -360,7 +373,9 @@ impl App {
         self.dirty = true;
     }
 
-    fn launch_library_game(&mut self, index: usize) {
+    pub(super) fn launch_library_game(&mut self, index: usize) {
+        // A stream needs the memory more than a detail screen that reloads from the disk cache.
+        self.release_detail_art();
         let game = self.library.games[index].clone();
         self.launch(&game);
     }
@@ -470,6 +485,10 @@ impl App {
     }
 
     pub(super) fn library_hover(&mut self) {
+        if self.library.detail.is_some() {
+            self.detail_hover();
+            return;
+        }
         let (x, y) = self.mouse;
         let before = (self.library.focus, self.library.selected, self.library.genre_menu);
         if self.library.genre_menu.is_some() {
@@ -489,6 +508,10 @@ impl App {
     }
 
     pub(super) fn library_click(&mut self) {
+        if self.library.detail.is_some() {
+            self.detail_click();
+            return;
+        }
         let (x, y) = self.mouse;
         if self.library.genre_menu.is_some() {
             match self.genre_menu_rows().into_iter().find(|row| row.rect.contains(x, y)) {
@@ -517,8 +540,51 @@ impl App {
         self.library.follow_selection()
     }
 
-    pub(super) fn draw_library(&mut self, window: &mut Window) {
+    /// Asks the artwork thread for `url` drawn at `w` by `h` canvas units, unless it is loaded or
+    /// on its way.
+    pub(super) fn want_art(&mut self, url: &str, w: f32, h: f32, radius: f32) {
+        if self.library.art.contains_key(url) {
+            return;
+        }
+        self.library.art.insert(url.to_owned(), Art::Requested);
         let scale = self.painter.scale();
+        let px = |units: f32| (units * scale).round() as u32;
+        let _ = self.art.send(art::Message::Want(art::Job { url: url.to_owned(), width: px(w), height: px(h), radius: px(radius) }));
+    }
+
+    /// Tells the artwork thread what is on screen now, so work for anything else is dropped.
+    pub(super) fn show_art(&mut self, on_screen: HashSet<String>) {
+        if on_screen == self.library.on_screen {
+            return;
+        }
+        // Requests for artwork no longer shown are dropped by the artwork thread; forgetting them
+        // here makes them ask again if they come back into view.
+        self.library.art.retain(|url, art| !matches!(art, Art::Requested) || on_screen.contains(url));
+        let _ = self.art.send(art::Message::Visible(on_screen.clone()));
+        self.library.on_screen = on_screen;
+    }
+
+    /// Textures can only be made on this thread. Artwork no longer asked for (a closed detail
+    /// screen, a scrolled-past tile) is not kept.
+    fn upload_art(&mut self, window: &mut Window) {
+        for (url, pixels) in std::mem::take(&mut self.library.pending) {
+            if !matches!(self.library.art.get(&url), Some(Art::Requested)) {
+                continue;
+            }
+            let state = match window.texture(pixels.width, pixels.height, &pixels.rgba) {
+                Ok(texture) => Art::Ready(texture),
+                Err(_) => Art::Missing,
+            };
+            self.library.art.insert(url, state);
+        }
+    }
+
+    pub(super) fn draw_library(&mut self, window: &mut Window) {
+        self.upload_art(window);
+        if self.library.detail.is_some() {
+            self.draw_detail(window);
+            return;
+        }
         let typing = self.keyboard.is_some();
         let header = self.header_buttons();
         let tools = self.toolbar_buttons();
@@ -562,46 +628,22 @@ impl App {
             return;
         }
 
-        // Upload finished artwork (textures can only be made on this thread).
-        for (url, pixels) in std::mem::take(&mut self.library.pending) {
-            let state = match window.texture(pixels.width, pixels.height, &pixels.rgba) {
-                Ok(texture) => Art::Ready(texture),
-                Err(_) => Art::Missing,
-            };
-            self.library.art.insert(url, state);
-        }
-
         let first_row = (self.library.scroll / ROW_H).floor().max(0.0) as usize;
         let rows = ((GRID_BOTTOM - GRID_TOP) / ROW_H).ceil() as usize + 2;
         let visible = first_row * COLUMNS..((first_row + rows) * COLUMNS).min(shown);
         let visible = visible.start.min(visible.end)..visible.end;
         let on_screen: HashSet<String> =
             self.library.view[visible.clone()].iter().filter_map(|&index| self.library.games[index].art.clone()).collect();
-        if on_screen != self.library.on_screen {
-            // Requests for tiles scrolled past are dropped by the artwork thread; forgetting them
-            // here makes them ask again if they come back into view.
-            self.library.art.retain(|url, art| !matches!(art, Art::Requested) || on_screen.contains(url));
-            let _ = self.art.send(art::Message::Visible(on_screen.clone()));
-            self.library.on_screen = on_screen;
-        }
+        self.show_art(on_screen);
         let clip = self.painter.area(Rect::new(0.0, GRID_TOP - 24.0, CANVAS_W, GRID_BOTTOM - GRID_TOP + 24.0));
         window.clip(Some(clip));
         for position in visible {
             let rect = self.tile_rect(position);
             let focused = position == self.library.selected && self.library.focus == Focus::Grid && !menu_open;
-            let game = &self.library.games[self.library.view[position]];
-            if let Some(url) = &game.art {
-                if !self.library.art.contains_key(url) {
-                    self.library.art.insert(url.clone(), Art::Requested);
-                    let job = art::Job {
-                        url: url.clone(),
-                        width: (TILE_W * scale).round() as u32,
-                        height: (TILE_H * scale).round() as u32,
-                        radius: (TILE_RADIUS * scale).round() as u32,
-                    };
-                    let _ = self.art.send(art::Message::Want(job));
-                }
+            if let Some(url) = self.library.games[self.library.view[position]].art.clone() {
+                self.want_art(&url, TILE_W, TILE_H, TILE_RADIUS);
             }
+            let game = &self.library.games[self.library.view[position]];
             let p = &mut self.painter;
             if focused {
                 p.halo(window, rect, TILE_RADIUS, 6.0, ACCENT);
@@ -659,7 +701,8 @@ impl App {
         self.library.art.retain(|url, art| !matches!(art, Art::Ready(_)) || near.contains(url.as_str()));
     }
 
-    /// Developer aid: the library with sample games, no core and no artwork.
+    /// Developer aid: the library with sample games and no core. Two covers come from
+    /// `.claude/design/images` (not committed); the rest show their titles.
     pub(super) fn preview_library(&mut self, genre_menu: bool) {
         let sample = |title: &str, genres: &[&str], hdr: bool| Game {
             app_id: Value::from(title),
@@ -667,7 +710,8 @@ impl App {
             art: None,
             genres: genres.iter().map(|g| (*g).to_owned()).collect(),
             search_text: format!("{} {}", title, genres.join(" ")).to_lowercase(),
-            variants: vec![account::Variant { id: "1".into(), store: "STEAM".into(), selected: true, in_library: true, hdr }],
+            variants: vec![account::Variant { id: "1".into(), store: "STEAM".into(), selected: true, in_library: true, hdr, ..Default::default() }],
+            ..Default::default()
         };
         self.user = "Player One".into();
         self.library.set_games(vec![
@@ -684,6 +728,9 @@ impl App {
             sample("Counter-Strike 2", &["SHOOTER"], false),
             sample("Hollow Knight", &["ADVENTURE", "INDIE"], false),
         ]);
+        let images = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/design/images");
+        self.library.games[0].art = Some(format!("{images}/cyberpunk-2077/game_box_art.jpg"));
+        self.library.games[1].art = Some(format!("{images}/fortnite/game_box_art.jpg"));
         self.library.set_genre_names(HashMap::from([("RPG".to_owned(), "Role-Playing".to_owned())]));
         if genre_menu {
             self.library.focus = Focus::Toolbar(1);
@@ -693,7 +740,7 @@ impl App {
     }
 }
 
-fn button(p: &mut Painter, window: &mut Window, rect: Rect, label: &str, focused: bool) {
+pub(super) fn button(p: &mut Painter, window: &mut Window, rect: Rect, label: &str, focused: bool) {
     if focused {
         p.halo(window, rect, 30.0, 4.0, ACCENT);
     }
@@ -721,7 +768,7 @@ mod tests {
             art: None,
             genres: genres.iter().map(|g| (*g).to_owned()).collect(),
             search_text: format!("{title} valve steam").to_lowercase(),
-            variants: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -788,7 +835,7 @@ mod tests {
         assert_eq!(library.view.len(), 8);
         assert_eq!(library.nav(Nav::Back), Outcome::Exit);
         library.nav(Nav::Down);
-        assert_eq!(library.nav(Nav::Select), Outcome::Launch(1));
+        assert_eq!(library.nav(Nav::Select), Outcome::Details(1));
     }
 
     #[test]

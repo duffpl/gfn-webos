@@ -36,6 +36,22 @@ pub enum Message {
 }
 
 const RETRY: Duration = Duration::from_millis(750);
+const IMAGE_SERVER: &str = "img.nvidiagrid.net";
+
+/// `url` asked of NVIDIA's image server at `width` pixels, so the TV downloads and decodes no
+/// more than it shows; the server keeps the aspect ratio. Other URLs are left as they are.
+pub fn sized(url: &str, width: u32) -> String {
+    if !url.contains(IMAGE_SERVER) {
+        return url.to_owned();
+    }
+    match url.find(";w=") {
+        Some(at) => {
+            let digits = url[at + 3..].find(|c: char| !c.is_ascii_digit()).map_or(url.len(), |end| at + 3 + end);
+            format!("{};w={width}{}", &url[..at], &url[digits..])
+        }
+        None => format!("{url};w={width}"),
+    }
+}
 
 /// Work for this thread, kept to what is on screen.
 #[derive(Default)]
@@ -136,6 +152,23 @@ pub fn spawn(core: Arc<CoreClient>, messages: Receiver<Message>, updates: Update
     }
 }
 
+/// For `--preview`: serves artwork from local files named by their URL, without the core.
+pub fn spawn_files(messages: Receiver<Message>, updates: Updates) {
+    let worker = move || {
+        for message in messages {
+            if let Message::Want(job) = message {
+                let path = job.url.split(';').next().unwrap_or_default().to_owned();
+                if updates.send(Update::Art { pixels: load(&path, &job), url: job.url }).is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    if let Err(error) = std::thread::Builder::new().name("gfn-artwork".into()).spawn(worker) {
+        eprintln!("artwork thread: {error}");
+    }
+}
+
 fn load(path: &str, job: &Job) -> Option<Pixels> {
     let decoded = match image::open(path) {
         Ok(decoded) => decoded.to_rgba8(),
@@ -151,7 +184,13 @@ fn load(path: &str, job: &Job) -> Option<Pixels> {
     let crop_w = ((width as f32 / scale).round() as u32).clamp(1, src_w);
     let crop_h = ((height as f32 / scale).round() as u32).clamp(1, src_h);
     let cropped = image::imageops::crop_imm(&decoded, (src_w - crop_w) / 2, (src_h - crop_h) / 2, crop_w, crop_h);
-    let mut rgba = image::imageops::resize(&cropped.to_image(), width, height, FilterType::Triangle).into_raw();
+    // Sized images from NVIDIA's server usually arrive at exactly this size; a 1080p resize pass
+    // costs the TV's CPU noticeably for nothing.
+    let mut rgba = if (crop_w, crop_h) == (width, height) {
+        cropped.to_image().into_raw()
+    } else {
+        image::imageops::resize(&cropped.to_image(), width, height, FilterType::Triangle).into_raw()
+    };
     round_corners(&mut rgba, width, height, job.radius);
     Some(Pixels { width, height, rgba })
 }
@@ -191,6 +230,15 @@ mod tests {
         let order: Vec<String> = std::iter::from_fn(|| pending.next()).map(|job| job.url).collect();
         assert_eq!(order, ["c", "x"]);
         assert!(pending.waiting.is_empty());
+    }
+
+    #[test]
+    fn image_server_urls_get_the_width_asked_for() {
+        let base = "https://img.nvidiagrid.net/apps/1/ZZ/HERO_IMAGE_1.jpg";
+        assert_eq!(sized(&format!("{base};f=jpg;w=1200"), 1920), format!("{base};f=jpg;w=1920"));
+        assert_eq!(sized(&format!("{base};w=900;f=jpg"), 320), format!("{base};w=320;f=jpg"));
+        assert_eq!(sized(base, 320), format!("{base};w=320"));
+        assert_eq!(sized("https://example.com/a.jpg;w=10", 320), "https://example.com/a.jpg;w=10");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{Update, Updates, art, session::sleep_unless_quit};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Game {
     pub app_id: Value,
     pub title: String,
@@ -21,31 +21,62 @@ pub struct Game {
     pub genres: Vec<String>,
     /// Lower-case title, publisher, developer, stores and genres, for search.
     pub search_text: String,
+    pub description: Option<String>,
+    /// Such as "PEGI 18".
+    pub rating: Option<String>,
+    /// ISO 8601, as NVIDIA sends them.
+    pub released: Option<String>,
+    pub last_played: Option<String>,
+    pub publisher: Option<String>,
+    pub developer: Option<String>,
+    pub hero: Option<String>,
+    pub screenshots: Vec<String>,
     pub variants: Vec<Variant>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Variant {
     pub id: String,
     pub store: String,
     pub selected: bool,
     pub in_library: bool,
     pub hdr: bool,
+    pub rtx: bool,
+    pub reflex: bool,
 }
 
 impl Game {
     /// The core requires `appId == variantId`: launch the store the user picked in GFN.
     pub fn launch_variant(&self) -> Option<&Variant> {
+        self.launch_index().map(|index| &self.variants[index])
+    }
+
+    pub fn launch_index(&self) -> Option<usize> {
         self.variants
             .iter()
-            .find(|v| v.selected)
-            .or_else(|| self.variants.iter().find(|v| v.in_library))
-            .or(self.variants.first())
+            .position(|v| v.selected)
+            .or_else(|| self.variants.iter().position(|v| v.in_library))
+            .or((!self.variants.is_empty()).then_some(0))
     }
 
     /// Whether the store version that would launch streams in HDR.
     pub fn hdr(&self) -> bool {
         self.launch_variant().is_some_and(|v| v.hdr)
+    }
+
+    /// The store versions the user can pick from: those they own, or every one if GFN marks none
+    /// as owned.
+    pub fn owned_variants(&self) -> Vec<usize> {
+        let owned: Vec<usize> = (0..self.variants.len()).filter(|&i| self.variants[i].in_library).collect();
+        if owned.is_empty() { (0..self.variants.len()).collect() } else { owned }
+    }
+
+    /// Launches from this store version from now on; only for this run of the app, GFN's own
+    /// choice is not changed.
+    pub fn select_variant(&mut self, index: usize) {
+        for (i, variant) in self.variants.iter_mut().enumerate() {
+            variant.selected = i == index;
+        }
     }
 
     pub fn has_id(&self, id: &str) -> bool {
@@ -238,6 +269,14 @@ fn game(value: &Value) -> Game {
         genres: value["genres"].as_array().into_iter().flatten().filter_map(text).collect(),
         search_text: text(&value["searchText"]).unwrap_or_else(|| title.to_lowercase()),
         title,
+        description: text(&value["description"]).map(|d| d.trim().to_owned()),
+        rating: rating(&value["contentRatings"]),
+        released: text(&value["releaseDate"]),
+        last_played: text(&value["lastPlayed"]),
+        publisher: text(&value["publisherName"]),
+        developer: text(&value["developerName"]),
+        hero: text(&value["heroImageUrl"]),
+        screenshots: value["screenshotUrls"].as_array().into_iter().flatten().filter_map(text).collect(),
         variants: value["variants"]
             .as_array()
             .into_iter()
@@ -245,14 +284,25 @@ fn game(value: &Value) -> Game {
             .filter_map(|v| {
                 Some(Variant {
                     id: text(&v["id"])?,
-                    store: text(&v["appStore"]).unwrap_or_default(),
+                    store: text(&v["store"]).unwrap_or_default(),
                     selected: v["librarySelected"] == true,
                     in_library: v["inLibrary"] == true,
                     hdr: v["hdr"] == true,
+                    rtx: v["rtx"] == true,
+                    reflex: v["reflex"] == true,
                 })
             })
             .collect(),
     }
+}
+
+/// PEGI where the game has it (this app's users are mostly in Europe), otherwise the first rating.
+fn rating(ratings: &Value) -> Option<String> {
+    let ratings = ratings.as_array()?;
+    let rating = ratings.iter().find(|r| r["system"] == "PEGI").or(ratings.first())?;
+    let (system, category) = (rating["system"].as_str()?, rating["category"].as_str()?);
+    let category = category.strip_prefix(system).map_or(category, |rest| rest.trim_start_matches(['_', ' ']));
+    Some(format!("{system} {category}"))
 }
 
 #[cfg(test)]
@@ -263,14 +313,42 @@ mod tests {
     fn library_entries_keep_genres_search_text_and_hdr() {
         let game = game(&json!({
             "id": "cms-1", "title": "Cyberpunk 2077", "genres": ["ACTION", "RPG"], "searchText": "cyberpunk 2077 cd projekt red steam",
-            "variants": [{"id": "1001", "appStore": "STEAM", "librarySelected": true, "inLibrary": true, "hdr": true}],
+            "variants": [{"id": "1001", "store": "STEAM", "librarySelected": true, "inLibrary": true, "hdr": true}],
         }));
         assert_eq!(game.genres, ["ACTION", "RPG"]);
         assert!(game.search_text.contains("projekt"));
         assert!(game.hdr());
+        assert_eq!(game.variants[0].store, "STEAM");
         let bare = super::game(&json!({"id": "cms-2", "title": "Portal 2", "variants": [{"id": "620"}]}));
         assert_eq!(bare.search_text, "portal 2");
         assert!(!bare.hdr());
+    }
+
+    #[test]
+    fn detail_fields_and_the_pegi_rating_are_kept() {
+        let game = game(&json!({
+            "id": "cms-1", "title": "Cyberpunk 2077", "description": " Night City. ", "releaseDate": "2020-12-10T00:00:00.000000+0000",
+            "publisherName": "CD PROJEKT RED", "heroImageUrl": "https://img/hero", "screenshotUrls": ["https://img/1", "", "https://img/2"],
+            "contentRatings": [{"system": "ESRB", "category": "M"}, {"system": "PEGI", "category": "PEGI_18"}],
+        }));
+        assert_eq!(game.description.as_deref(), Some("Night City."));
+        assert_eq!(game.rating.as_deref(), Some("PEGI 18"));
+        assert_eq!(game.released.as_deref(), Some("2020-12-10T00:00:00.000000+0000"));
+        assert_eq!(game.screenshots, ["https://img/1", "https://img/2"]);
+        assert_eq!(rating(&json!([{"system": "ESRB", "category": "M"}])).as_deref(), Some("ESRB M"));
+        assert_eq!(rating(&json!([])), None);
+    }
+
+    #[test]
+    fn the_store_picker_offers_owned_versions_and_moves_the_launch() {
+        let mut game = game(&json!({"id": "cms-1", "title": "T", "variants": [
+            {"id": "1", "store": "STEAM", "librarySelected": true, "inLibrary": true},
+            {"id": "2", "store": "EPIC", "inLibrary": false},
+            {"id": "3", "store": "XBOX", "inLibrary": true},
+        ]}));
+        assert_eq!(game.owned_variants(), [0, 2]);
+        game.select_variant(2);
+        assert_eq!(game.launch_variant().map(|v| v.id.as_str()), Some("3"));
     }
 
     #[test]

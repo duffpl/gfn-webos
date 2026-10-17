@@ -228,8 +228,9 @@ fn run(args: &[String]) -> Result<(), String> {
     let updates_tx = Updates::new(updates_tx, Some(gfn_sdl::Waker::new(&sdl)));
     let (art_tx, art_rx) = channel();
     let preview = flag(args, "--preview");
-    if preview.is_none() {
-        account::start(config, art_rx, art_tx.clone(), updates_tx.clone(), Arc::clone(&quit));
+    match preview {
+        None => account::start(config, art_rx, art_tx.clone(), updates_tx.clone(), Arc::clone(&quit)),
+        Some(_) => art::spawn_files(art_rx, updates_tx.clone()),
     }
     let bluetooth = bluetooth::start(updates_tx.clone());
     let mut app = ui::App::new(

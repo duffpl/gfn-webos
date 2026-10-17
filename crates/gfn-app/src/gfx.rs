@@ -140,11 +140,20 @@ pub struct Painter {
     text_bytes: usize,
     /// Anti-aliased discs by pixel radius; rounded rectangles draw their quadrants as corners.
     discs: HashMap<u32, Texture>,
+    fades: HashMap<Fade, Texture>,
+}
+
+/// The way a [`Painter::fade`] runs out: towards the right, the top or the bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Fade {
+    Right,
+    Up,
+    Down,
 }
 
 impl Painter {
     pub fn new(fonts: Fonts) -> Self {
-        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), text_bytes: 0, discs: HashMap::new() }
+        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), text_bytes: 0, discs: HashMap::new(), fades: HashMap::new() }
     }
 
     /// Call before drawing a frame: picks up the current output size and evicts stale text.
@@ -245,6 +254,22 @@ impl Painter {
         self.discs.get(&radius)
     }
 
+    /// `color` over `r`, at full strength on one side and gone on the side `fade` names.
+    pub fn fade(&mut self, window: &mut Window, r: Rect, color: Rgba, fade: Fade) {
+        if !self.fades.contains_key(&fade) {
+            let Ok(texture) = (match fade {
+                Fade::Right => window.texture(FADE_STEPS, 1, &fade_pixels(false)),
+                Fade::Up => window.texture(1, FADE_STEPS, &fade_pixels(true)),
+                Fade::Down => window.texture(1, FADE_STEPS, &fade_pixels(false)),
+            }) else {
+                return;
+            };
+            self.fades.insert(fade, texture);
+        }
+        let area = self.area(r);
+        window.draw(&self.fades[&fade], None, area, color);
+    }
+
     pub fn image(&mut self, window: &mut Window, texture: &Texture, r: Rect, alpha: u8) {
         window.draw(texture, None, self.area(r), [255, 255, 255, alpha]);
     }
@@ -328,7 +353,8 @@ impl Painter {
         self.wrap(text, size, width).len() as f32 * size * 1.4
     }
 
-    fn wrap(&self, text: &str, size: f32, width: f32) -> Vec<String> {
+    /// `text` broken into the lines [`Painter::paragraph`] would draw.
+    pub fn wrap(&self, text: &str, size: f32, width: f32) -> Vec<String> {
         let mut lines = Vec::new();
         for paragraph in text.split('\n') {
             let mut line = String::new();
@@ -344,6 +370,18 @@ impl Painter {
         }
         lines
     }
+}
+
+const FADE_STEPS: u32 = 256;
+
+/// A white strip from opaque to clear, or clear to opaque when `rising`.
+fn fade_pixels(rising: bool) -> Vec<u8> {
+    (0..FADE_STEPS)
+        .flat_map(|i| {
+            let alpha = (255 * i / (FADE_STEPS - 1)) as u8;
+            [255, 255, 255, if rising { alpha } else { 255 - alpha }]
+        })
+        .collect()
 }
 
 /// White disc of `radius` pixels with a one-pixel anti-aliased edge.
