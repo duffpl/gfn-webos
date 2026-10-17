@@ -1,5 +1,6 @@
 //! Start-up on a worker thread: spawn the core, sign in (device code) and fetch the library.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
@@ -16,6 +17,10 @@ pub struct Game {
     pub app_id: Value,
     pub title: String,
     pub art: Option<String>,
+    /// NVIDIA's genre codes; [`Progress::Genres`] names them.
+    pub genres: Vec<String>,
+    /// Lower-case title, publisher, developer, stores and genres, for search.
+    pub search_text: String,
     pub variants: Vec<Variant>,
 }
 
@@ -25,6 +30,7 @@ pub struct Variant {
     pub store: String,
     pub selected: bool,
     pub in_library: bool,
+    pub hdr: bool,
 }
 
 impl Game {
@@ -37,6 +43,11 @@ impl Game {
             .or(self.variants.first())
     }
 
+    /// Whether the store version that would launch streams in HDR.
+    pub fn hdr(&self) -> bool {
+        self.launch_variant().is_some_and(|v| v.hdr)
+    }
+
     pub fn has_id(&self, id: &str) -> bool {
         self.variants.iter().any(|v| v.id == id) || self.app_id.as_str() == Some(id) || self.app_id.to_string() == id
     }
@@ -47,6 +58,8 @@ pub enum Progress {
     SignIn { code: String, uri: String, uri_complete: String },
     SignedIn { core: Arc<CoreClient>, user: String, scope: Value },
     Library(Vec<Game>),
+    /// Genre code to display name, once known.
+    Genres(HashMap<String, String>),
     Failed(String),
 }
 
@@ -106,6 +119,11 @@ fn run(
     let user = session["session"]["user"]["displayName"].as_str().unwrap_or("").to_owned();
     send(Progress::SignedIn { core: Arc::clone(&core), user, scope });
     send(Progress::Library(library(&call)?));
+    // Codes stand in for names until (or unless) these arrive.
+    match call("catalog.definitions.get", json!({}), 30) {
+        Ok(definitions) => send(Progress::Genres(genre_names(&definitions))),
+        Err(error) => eprintln!("genre names: {error}"),
+    }
     Ok(())
 }
 
@@ -202,12 +220,24 @@ fn library(call: &Call<'_>) -> Result<Vec<Game>, String> {
     }
 }
 
+fn genre_names(definitions: &Value) -> HashMap<String, String> {
+    definitions["genres"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| Some((item["genre"].as_str()?.to_owned(), item["label"].as_str()?.to_owned())))
+        .collect()
+}
+
 fn game(value: &Value) -> Game {
     let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    let title = text(&value["title"]).unwrap_or_else(|| "Untitled".into());
     Game {
         app_id: value["id"].clone(),
-        title: text(&value["title"]).unwrap_or_else(|| "Untitled".into()),
         art: text(&value["imageUrl"]).or_else(|| text(&value["keyArtUrl"])).or_else(|| text(&value["heroImageUrl"])),
+        genres: value["genres"].as_array().into_iter().flatten().filter_map(text).collect(),
+        search_text: text(&value["searchText"]).unwrap_or_else(|| title.to_lowercase()),
+        title,
         variants: value["variants"]
             .as_array()
             .into_iter()
@@ -218,8 +248,34 @@ fn game(value: &Value) -> Game {
                     store: text(&v["appStore"]).unwrap_or_default(),
                     selected: v["librarySelected"] == true,
                     in_library: v["inLibrary"] == true,
+                    hdr: v["hdr"] == true,
                 })
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_entries_keep_genres_search_text_and_hdr() {
+        let game = game(&json!({
+            "id": "cms-1", "title": "Cyberpunk 2077", "genres": ["ACTION", "RPG"], "searchText": "cyberpunk 2077 cd projekt red steam",
+            "variants": [{"id": "1001", "appStore": "STEAM", "librarySelected": true, "inLibrary": true, "hdr": true}],
+        }));
+        assert_eq!(game.genres, ["ACTION", "RPG"]);
+        assert!(game.search_text.contains("projekt"));
+        assert!(game.hdr());
+        let bare = super::game(&json!({"id": "cms-2", "title": "Portal 2", "variants": [{"id": "620"}]}));
+        assert_eq!(bare.search_text, "portal 2");
+        assert!(!bare.hdr());
+    }
+
+    #[test]
+    fn genre_names_come_from_the_definitions_section() {
+        let names = genre_names(&json!({"genres": {"metadataKind": "genres", "items": [{"genre": "RPG", "label": "Role-Playing"}, {"genre": "X"}]}}));
+        assert_eq!(names, HashMap::from([("RPG".to_owned(), "Role-Playing".to_owned())]));
     }
 }

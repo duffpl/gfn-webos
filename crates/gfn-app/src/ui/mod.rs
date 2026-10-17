@@ -22,6 +22,10 @@ use crate::session::{self, Profile, Stats, Takeover};
 use crate::settings::{self, StreamSettings};
 use crate::{TV, Update, Updates};
 
+mod library;
+
+use library::{Art, Library};
+
 const BACKGROUND: Rgba = [14, 15, 18, 255];
 const PANEL: Rgba = [30, 32, 38, 255];
 const TILE: Rgba = [38, 40, 48, 255];
@@ -35,18 +39,6 @@ const SCRIM: Rgba = [0, 0, 0, 170];
 const CLEAR: Rgba = [0, 0, 0, 0];
 
 const MARGIN: f32 = 96.0;
-const COLUMNS: usize = 6;
-const TILE_W: f32 = 240.0;
-const TILE_H: f32 = 320.0;
-const TILE_RADIUS: f32 = 12.0;
-const ROW_H: f32 = TILE_H + 84.0;
-const GRID_TOP: f32 = 180.0;
-const GRID_BOTTOM: f32 = 990.0;
-/// Artwork textures kept before those far from the viewport are dropped (about 300 KB each at
-/// 1080p); dropped ones reload from the core's disk cache when scrolled back into view.
-const ART_KEPT: usize = 96;
-/// Rows either side of the visible ones whose artwork survives eviction.
-const ART_MARGIN_ROWS: usize = 3;
 
 const HINT_FOR: Duration = Duration::from_secs(6);
 
@@ -140,25 +132,6 @@ enum Screen {
     Fatal,
 }
 
-enum Art {
-    Requested,
-    Ready(Texture),
-    Missing,
-}
-
-struct Library {
-    games: Vec<Game>,
-    focus: usize,
-    /// A button above the grid has focus instead of a tile; `header_focus` says which.
-    header: bool,
-    header_focus: usize,
-    scroll: f32,
-    art: HashMap<String, Art>,
-    pending: HashMap<String, art::Pixels>,
-    /// The artwork last reported to the artwork thread as on screen.
-    on_screen: HashSet<String>,
-}
-
 pub struct App {
     painter: Painter,
     screen: Screen,
@@ -207,11 +180,12 @@ impl App {
         bluetooth: bluetooth::Handle,
         (stream_settings, settings_path): (StreamSettings, PathBuf),
     ) -> Self {
+        let library = Library::new(settings_path.with_file_name("library-view.json"));
         Self {
             painter,
             screen: Screen::Starting("Starting".into()),
             menu: None,
-            library: Library { games: Vec::new(), focus: 0, header: false, header_focus: 0, scroll: 0.0, art: HashMap::new(), pending: HashMap::new(), on_screen: HashSet::new() },
+            library,
             core: None,
             scope: Value::Null,
             user: String::new(),
@@ -296,7 +270,13 @@ impl App {
             // The simulator's scripted Bluetooth service fills the list over the first seconds.
             "controllers" => self.open_controllers(),
             "settings" => self.screen = Screen::Settings,
-            other => return Err(format!("--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings")),
+            "library" => self.preview_library(false),
+            "genres" => self.preview_library(true),
+            other => {
+                return Err(format!(
+                    "--preview {other}: one of signin, queue, launching, conflict, menu, stats, keyboard, error, controllers, settings, library, genres"
+                ));
+            }
         }
         Ok(())
     }
@@ -384,10 +364,10 @@ impl App {
                 self.screen = Screen::Starting("Loading your library".into());
             }
             account::Progress::Library(games) => {
-                self.library.games = games;
-                self.library.focus = 0;
+                self.library.set_games(games);
                 self.screen = Screen::Library;
             }
+            account::Progress::Genres(names) => self.library.set_genre_names(names),
             account::Progress::Failed(message) => {
                 if !self.quitting {
                     self.screen = Screen::Fatal;
@@ -556,6 +536,21 @@ impl App {
             }
             return;
         }
+        if matches!(self.screen, Screen::Library) && self.menu.is_none() {
+            if self.keyboard.is_some() {
+                self.library_typing(event);
+                return;
+            }
+            let play = match event {
+                InputEvent::Key { scancode, keycode, pressed: true, repeat: false, .. } => is_remote_key(scancode, keycode, KEYCODE_GREEN),
+                InputEvent::ControllerButton { button: 2, pressed: true, .. } => true,
+                _ => false,
+            };
+            if play {
+                self.library_play();
+                return;
+            }
+        }
         match event {
             InputEvent::MouseMotion { x, y, .. } => {
                 self.mouse = self.painter.to_canvas(window, x, y);
@@ -651,41 +646,6 @@ impl App {
         }
     }
 
-    fn library_nav(&mut self, nav: Nav) {
-        let count = self.library.games.len();
-        if count == 0 {
-            self.library.header = true;
-        }
-        if self.library.header {
-            let last = HEADER_BUTTONS.len() - 1;
-            match nav {
-                Nav::Down if count > 0 => self.library.header = false,
-                Nav::Left => self.library.header_focus = self.library.header_focus.saturating_sub(1),
-                Nav::Right => self.library.header_focus = (self.library.header_focus + 1).min(last),
-                Nav::Select => self.open_header(HEADER_BUTTONS[self.library.header_focus.min(last)]),
-                Nav::Back => self.menu = Some(exit_menu()),
-                _ => {}
-            }
-            return;
-        }
-        let focus = &mut self.library.focus;
-        match nav {
-            Nav::Up if *focus < COLUMNS => self.library.header = true,
-            Nav::Left if *focus % COLUMNS > 0 => *focus -= 1,
-            Nav::Right if *focus % COLUMNS + 1 < COLUMNS && *focus + 1 < count => *focus += 1,
-            Nav::Up if *focus >= COLUMNS => *focus -= COLUMNS,
-            Nav::Down if *focus + COLUMNS < count => *focus += COLUMNS,
-            // The last row may be short: moving down from above it lands on its last tile.
-            Nav::Down if *focus / COLUMNS + 1 < count.div_ceil(COLUMNS) => *focus = count - 1,
-            Nav::Select if count > 0 => {
-                let game = self.library.games[*focus].clone();
-                self.launch(&game);
-            }
-            Nav::Back => self.menu = Some(exit_menu()),
-            _ => {}
-        }
-    }
-
     fn act(&mut self, action: Action) {
         self.dirty = true;
         self.menu = None;
@@ -737,12 +697,6 @@ impl App {
         self.screen = Screen::Launching { title: game.title.clone(), status: "Starting".into(), queue: None };
     }
 
-    fn tile_rect(&self, index: usize) -> Rect {
-        let gap = (CANVAS_W - 2.0 * MARGIN - COLUMNS as f32 * TILE_W) / (COLUMNS as f32 - 1.0);
-        let (row, col) = (index / COLUMNS, index % COLUMNS);
-        Rect::new(MARGIN + col as f32 * (TILE_W + gap), GRID_TOP + row as f32 * ROW_H - self.library.scroll, TILE_W, TILE_H)
-    }
-
     fn menu_buttons(&self) -> Vec<Rect> {
         let Some(menu) = &self.menu else { return Vec::new() };
         let layout = self.menu_layout(menu);
@@ -762,24 +716,7 @@ impl App {
             return;
         }
         if matches!(self.screen, Screen::Library) {
-            let hit = self.header_buttons().iter().position(|(rect, _, _)| rect.contains(x, y));
-            if let Some(index) = hit {
-                if !self.library.header || self.library.header_focus != index {
-                    (self.library.header, self.library.header_focus) = (true, index);
-                    self.dirty = true;
-                }
-            } else if self.library.header && (GRID_TOP - 20.0..GRID_BOTTOM).contains(&y) {
-                self.library.header = false;
-                self.dirty = true;
-            }
-        }
-        if matches!(self.screen, Screen::Library) && (GRID_TOP - 20.0..GRID_BOTTOM).contains(&y) {
-            let hit = (0..self.library.games.len()).find(|&i| self.tile_rect(i).contains(x, y));
-            if let Some(index) = hit.filter(|&i| i != self.library.focus || self.library.header) {
-                self.library.focus = index;
-                self.library.header = false;
-                self.dirty = true;
-            }
+            self.library_hover();
         }
         if matches!(self.screen, Screen::Settings) {
             let hit = (0..SettingRow::ALL.len()).find(|&i| settings_row_rect(i).contains(x, y));
@@ -808,10 +745,8 @@ impl App {
             return;
         }
         if matches!(self.screen, Screen::Library) {
-            if let Some((_, _, button)) = self.header_buttons().into_iter().find(|(rect, _, _)| rect.contains(x, y)) {
-                self.open_header(button);
-                return;
-            }
+            self.library_click();
+            return;
         }
         if matches!(self.screen, Screen::Settings) {
             if let Some(index) = (0..SettingRow::ALL.len()).find(|&i| settings_row_rect(i).contains(x, y)) {
@@ -834,13 +769,6 @@ impl App {
             }
             return;
         }
-        if matches!(self.screen, Screen::Library) && (GRID_TOP - 20.0..GRID_BOTTOM).contains(&y) {
-            if let Some(index) = (0..self.library.games.len()).find(|&i| self.tile_rect(i).contains(x, y)) {
-                self.library.focus = index;
-                let game = self.library.games[index].clone();
-                self.launch(&game);
-            }
-        }
     }
 
     /// Advances animations; true while something on screen is moving.
@@ -855,23 +783,8 @@ impl App {
             moving |= expired_unseen(hint_until);
             moving |= self.notice.as_ref().is_some_and(|(_, until)| expired_unseen(*until));
         }
-        if matches!(self.screen, Screen::Library) && !self.library.games.is_empty() {
-            let row = (self.library.focus / COLUMNS) as f32;
-            let visible = GRID_BOTTOM - GRID_TOP;
-            let (top, bottom) = (row * ROW_H, row * ROW_H + ROW_H);
-            let mut target = self.library.scroll;
-            if top < target {
-                target = top;
-            } else if bottom > target + visible {
-                target = bottom - visible;
-            }
-            let delta = target - self.library.scroll;
-            if delta.abs() > 0.5 {
-                self.library.scroll += delta * 0.25;
-                moving = true;
-            } else {
-                self.library.scroll = target;
-            }
+        if matches!(self.screen, Screen::Library) {
+            moving |= self.library_moving();
         }
         moving
     }
@@ -1001,100 +914,6 @@ impl App {
         }
     }
 
-    fn draw_library(&mut self, window: &mut Window) {
-        let scale = self.painter.scale();
-        let p = &mut self.painter;
-        p.text(window, "GeForce NOW", MARGIN, 64.0, 48.0, TEXT, true, Align::Left);
-        p.text(window, &self.user, CANVAS_W - MARGIN, 76.0, 30.0, DIM, false, Align::Right);
-        footer(p, window, "OK  Play     Back  Exit");
-        for (index, (rect, label, _)) in self.header_buttons().into_iter().enumerate() {
-            let focused = self.library.header && index == self.library.header_focus;
-            let p = &mut self.painter;
-            if focused {
-                p.halo(window, rect, 30.0, 4.0, ACCENT);
-            }
-            p.round_rect(window, rect, 30.0, if focused { ACCENT } else { BUTTON });
-            let color = if focused { ON_ACCENT } else { TEXT };
-            p.text(window, &label, rect.x + rect.w / 2.0, rect.y + 14.0, 28.0, color, true, Align::Center);
-        }
-        let p = &mut self.painter;
-        if self.library.games.is_empty() {
-            p.text(window, "Your library is empty", CANVAS_W / 2.0, 440.0, 44.0, TEXT, true, Align::Center);
-            p.text(window, "Add games at play.geforcenow.com and they will show up here.", CANVAS_W / 2.0, 510.0, 30.0, DIM, false, Align::Center);
-            return;
-        }
-
-        // Upload finished artwork (textures can only be made on this thread).
-        for (url, pixels) in std::mem::take(&mut self.library.pending) {
-            let state = match window.texture(pixels.width, pixels.height, &pixels.rgba) {
-                Ok(texture) => Art::Ready(texture),
-                Err(_) => Art::Missing,
-            };
-            self.library.art.insert(url, state);
-        }
-
-        let first_row = (self.library.scroll / ROW_H).floor().max(0.0) as usize;
-        let rows = ((GRID_BOTTOM - GRID_TOP) / ROW_H).ceil() as usize + 2;
-        let visible = first_row * COLUMNS..((first_row + rows) * COLUMNS).min(self.library.games.len());
-        let on_screen: HashSet<String> =
-            self.library.games[visible.start.min(visible.end)..visible.end].iter().filter_map(|g| g.art.clone()).collect();
-        if on_screen != self.library.on_screen {
-            // Requests for tiles scrolled past are dropped by the artwork thread; forgetting them
-            // here makes them ask again if they come back into view.
-            self.library.art.retain(|url, art| !matches!(art, Art::Requested) || on_screen.contains(url));
-            let _ = self.art.send(art::Message::Visible(on_screen.clone()));
-            self.library.on_screen = on_screen;
-        }
-        let clip = self.painter.area(Rect::new(0.0, GRID_TOP - 24.0, CANVAS_W, GRID_BOTTOM - GRID_TOP + 24.0));
-        window.clip(Some(clip));
-        for index in visible {
-            let rect = self.tile_rect(index);
-            let focused = index == self.library.focus && !self.library.header;
-            let game = &self.library.games[index];
-            if let Some(url) = &game.art {
-                if !self.library.art.contains_key(url) {
-                    self.library.art.insert(url.clone(), Art::Requested);
-                    let job = art::Job {
-                        url: url.clone(),
-                        width: (TILE_W * scale).round() as u32,
-                        height: (TILE_H * scale).round() as u32,
-                        radius: (TILE_RADIUS * scale).round() as u32,
-                    };
-                    let _ = self.art.send(art::Message::Want(job));
-                }
-            }
-            let p = &mut self.painter;
-            if focused {
-                p.halo(window, rect, TILE_RADIUS, 6.0, ACCENT);
-            }
-            match game.art.as_ref().and_then(|url| self.library.art.get(url)) {
-                Some(Art::Ready(texture)) => {
-                    p.round_rect(window, rect, TILE_RADIUS, TILE);
-                    p.image(window, texture, rect, 255);
-                }
-                _ => {
-                    p.round_rect(window, rect, TILE_RADIUS, TILE);
-                    p.paragraph(window, &game.title, Rect::new(rect.x + 20.0, rect.y + 130.0, rect.w - 40.0, 200.0), 26.0, DIM, Align::Center);
-                }
-            }
-            let title = p.fit(&game.title, 26.0, focused, TILE_W);
-            p.text(window, &title, rect.x, rect.y + TILE_H + 18.0, 26.0, if focused { TEXT } else { DIM }, focused, Align::Left);
-        }
-        window.clip(None);
-        self.evict_far_art(first_row, rows);
-    }
-
-    fn evict_far_art(&mut self, first_row: usize, rows: usize) {
-        let ready = self.library.art.values().filter(|art| matches!(art, Art::Ready(_))).count();
-        if ready <= ART_KEPT {
-            return;
-        }
-        let start = first_row.saturating_sub(ART_MARGIN_ROWS) * COLUMNS;
-        let end = ((first_row + rows + ART_MARGIN_ROWS) * COLUMNS).min(self.library.games.len());
-        let near: HashSet<&str> = self.library.games[start.min(end)..end].iter().filter_map(|g| g.art.as_deref()).collect();
-        self.library.art.retain(|url, art| !matches!(art, Art::Ready(_)) || near.contains(url.as_str()));
-    }
-
     fn draw_stats(&mut self, window: &mut Window) {
         let rows = stats_rows(self.profile.as_ref(), self.stats.as_ref());
         // Below the start hint, which is centred along the top.
@@ -1157,8 +976,9 @@ struct Keyboard {
 }
 
 impl App {
+    /// For the game during a stream, or for the library's search field.
     fn open_keyboard(&mut self) {
-        if self.keyboard.is_some() || !self.is_streaming() {
+        if self.keyboard.is_some() || !(self.is_streaming() || matches!(self.screen, Screen::Library)) {
             return;
         }
         println!("keyboard: open (screen keyboard support={})", gfn_sdl::has_screen_keyboard());
@@ -1310,42 +1130,6 @@ impl App {
         self.controller_layout().0
     }
 
-    /// Left to right, ending beside the user's name.
-    fn header_buttons(&self) -> Vec<(Rect, String, Header)> {
-        let mut right = CANVAS_W - MARGIN - self.painter.text_width(&self.user, 30.0, false) - 40.0;
-        let mut buttons: Vec<_> = HEADER_BUTTONS
-            .iter()
-            .rev()
-            .map(|&button| {
-                let label = match button {
-                    Header::Settings => "Settings".to_owned(),
-                    Header::Controllers => match self.controllers.connected() {
-                        0 => "Controllers".into(),
-                        n => format!("Controllers · {n} connected"),
-                    },
-                };
-                let w = self.painter.text_width(&label, 28.0, true) + 64.0;
-                right -= w;
-                let rect = Rect::new(right, 58.0, w, 60.0);
-                right -= 20.0;
-                (rect, label, button)
-            })
-            .collect();
-        buttons.reverse();
-        buttons
-    }
-
-    fn open_header(&mut self, button: Header) {
-        match button {
-            Header::Settings => {
-                self.settings_focus = 0;
-                self.screen = Screen::Settings;
-            }
-            Header::Controllers => self.open_controllers(),
-        }
-        self.dirty = true;
-    }
-
     fn draw_controllers(&mut self, window: &mut Window) {
         let t = self.clock.elapsed().as_secs_f32();
         let (rows, labels) = self.controller_layout();
@@ -1425,14 +1209,6 @@ impl App {
             })
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Header {
-    Settings,
-    Controllers,
-}
-
-const HEADER_BUTTONS: [Header; 2] = [Header::Settings, Header::Controllers];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingRow {
