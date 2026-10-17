@@ -7,7 +7,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$root/scripts/webos-env.sh"
 
 cd "$root"
-cargo +nightly build "${WEBOS_CARGO_ARGS[@]}" --release -p gfn-app -p gfn-probe
+cargo "+$WEBOS_RUST_TOOLCHAIN" build "${WEBOS_CARGO_ARGS[@]}" --release -p gfn-app -p gfn-probe
 
 # opennow-core is its own package in the OpenNOW submodule. Its TV flags are given here rather
 # than inherited from this repo's .cargo/config.toml, which also exports a Starfish hook symbol
@@ -16,7 +16,7 @@ core_target="$root/target/opennow-core"
 (
     cd "$root/vendor/OpenNOW/native/opennow-core"
     CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABI_RUSTFLAGS="-C target-cpu=cortex-a9 -C target-feature=-neon -C force-frame-pointers=yes --cfg getrandom_backend=\"linux_raw\"" \
-        cargo +nightly build "${WEBOS_CARGO_ARGS[@]}" --release --bin opennow-core --target-dir "$core_target"
+        cargo "+$WEBOS_RUST_TOOLCHAIN" build "${WEBOS_CARGO_ARGS[@]}" --release --bin opennow-core --target-dir "$core_target"
 )
 
 out="$root/target/arm-unknown-linux-gnueabi/release"

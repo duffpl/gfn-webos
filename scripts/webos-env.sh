@@ -21,6 +21,9 @@ export CMAKE_TOOLCHAIN_FILE_arm_unknown_linux_gnueabi="$_gfn_root/scripts/webos-
 # RUSTFLAGS would replace .cargo/config.toml's target rustflags wholesale (losing the SIGILL guard).
 unset RUSTFLAGS
 
-# Usage: cargo +nightly build "${WEBOS_CARGO_ARGS[@]}" ...
+# -Zbuild-std needs a nightly; the CI image pins one through WEBOS_RUST_TOOLCHAIN.
+WEBOS_RUST_TOOLCHAIN="${WEBOS_RUST_TOOLCHAIN:-nightly}"
+export WEBOS_RUST_TOOLCHAIN
+# Usage: cargo "+$WEBOS_RUST_TOOLCHAIN" build "${WEBOS_CARGO_ARGS[@]}" ...
 WEBOS_CARGO_ARGS=(-Zbuild-std=std,panic_unwind --target arm-unknown-linux-gnueabi)
 unset _gfn_root
