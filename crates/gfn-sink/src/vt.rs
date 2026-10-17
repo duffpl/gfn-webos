@@ -210,8 +210,17 @@ impl VideoDecoder for VtDecoder {
                 }
             }
         }
-        if !parameter_sets.is_empty() && parameter_sets != self.parameter_sets {
-            self.rebuild(parameter_sets)?;
+        if !parameter_sets.is_empty() {
+            // An access unit may repeat only some sets (a lone PPS); merged by type, the cached
+            // set stays whole and an unchanged one does not tear the session down.
+            let merged = merge_parameter_sets(&self.parameter_sets, parameter_sets, self.hevc);
+            if merged != self.parameter_sets {
+                if complete_parameter_sets(&merged, self.hevc) {
+                    self.rebuild(merged)?;
+                } else if self.session.is_none() {
+                    self.parameter_sets = merged;
+                }
+            }
         }
         let (Some(session), Some(format)) = (&self.session, &self.format) else {
             return Err("no parameter sets received yet".into());
@@ -241,8 +250,8 @@ impl VideoDecoder for VtDecoder {
 }
 
 impl VtDecoder {
+    /// The old session keeps decoding until the new format and session both exist.
     fn rebuild(&mut self, parameter_sets: Vec<Vec<u8>>) -> Result<(), String> {
-        self.close();
         let pointers: Vec<*const u8> = parameter_sets.iter().map(|p| p.as_ptr()).collect();
         let sizes: Vec<usize> = parameter_sets.iter().map(Vec::len).collect();
         unsafe {
@@ -290,6 +299,7 @@ impl VtDecoder {
                 VTDecompressionSessionCreate(kCFAllocatorDefault, format.0, null(), attributes.0, &record, &mut session),
                 "VTDecompressionSessionCreate",
             )?;
+            self.close();
             self.session = Some(Owned(session));
             self.format = Some(format);
         }
@@ -406,6 +416,30 @@ enum NalKind {
     Skip,
 }
 
+fn nal_type(nal: &[u8], hevc: bool) -> u8 {
+    let header = nal.first().copied().unwrap_or(0);
+    if hevc { (header >> 1) & 0x3f } else { header & 0x1f }
+}
+
+/// One set per type, ordered as the format description wants them (VPS, SPS, PPS).
+fn merge_parameter_sets(cached: &[Vec<u8>], fresh: Vec<Vec<u8>>, hevc: bool) -> Vec<Vec<u8>> {
+    let mut merged = cached.to_vec();
+    for set in fresh {
+        let kind = nal_type(&set, hevc);
+        match merged.iter_mut().find(|cached| nal_type(cached, hevc) == kind) {
+            Some(cached) => *cached = set,
+            None => merged.push(set),
+        }
+    }
+    merged.sort_by_key(|set| nal_type(set, hevc));
+    merged
+}
+
+fn complete_parameter_sets(sets: &[Vec<u8>], hevc: bool) -> bool {
+    let needed: &[u8] = if hevc { &[32, 33, 34] } else { &[7, 8] };
+    needed.iter().all(|&kind| sets.iter().any(|set| nal_type(set, hevc) == kind))
+}
+
 fn nal_kind(nal: &[u8], hevc: bool) -> NalKind {
     let Some(&header) = nal.first() else { return NalKind::Skip };
     if hevc {
@@ -457,6 +491,16 @@ mod tests {
         assert_eq!(units, vec![&[0x67, 1, 2][..], &[0x68, 3], &[0x09, 0xf0], &[0x65, 4, 5]]);
         let kinds: Vec<NalKind> = units.iter().map(|n| nal_kind(n, false)).collect();
         assert_eq!(kinds, vec![NalKind::ParameterSet, NalKind::ParameterSet, NalKind::Skip, NalKind::Slice]);
+    }
+
+    #[test]
+    fn a_lone_pps_updates_the_cached_set_in_place() {
+        let (sps, pps, new_pps) = (vec![0x67, 1], vec![0x68, 1], vec![0x68, 2]);
+        let merged = merge_parameter_sets(&[sps.clone(), pps], vec![new_pps.clone()], false);
+        assert_eq!(merged, vec![sps.clone(), new_pps.clone()]);
+        assert!(complete_parameter_sets(&merged, false));
+        assert!(!complete_parameter_sets(&[new_pps], false));
+        assert_eq!(merge_parameter_sets(&[], vec![vec![0x68, 1], sps.clone()], false)[0], sps);
     }
 
     #[test]

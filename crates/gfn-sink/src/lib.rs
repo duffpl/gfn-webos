@@ -57,6 +57,19 @@ pub fn use_ndl() -> bool {
     USE_NDL.load(Ordering::Relaxed)
 }
 
+/// While another app has the screen the TV takes the video plane away, and a player fed through
+/// that keeps showing black after the app returns; the video thread closes its decoder for the
+/// duration and opens a fresh one afterwards (PlxNative's suspend/reload on the same events).
+static BACKGROUNDED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_backgrounded(backgrounded: bool) {
+    BACKGROUNDED.store(backgrounded, Ordering::Relaxed);
+}
+
+fn backgrounded() -> bool {
+    BACKGROUNDED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoded {
     Accepted,

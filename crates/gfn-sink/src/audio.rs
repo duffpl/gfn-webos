@@ -14,6 +14,7 @@ const MAX_OUTPUT_BACKLOG_MS: u32 = 120;
 /// Silence queued ahead of the first packet and after the device ran dry, so ordinary network
 /// jitter between 20 ms packets is absorbed instead of heard as a gap per late packet.
 const CUSHION_MS: u32 = 40;
+const CUSHION: [i16; (SAMPLE_RATE * CUSHION_MS / 1000) as usize * 2] = [0; (SAMPLE_RATE * CUSHION_MS / 1000) as usize * 2];
 const MAX_FRAME_SAMPLES_PER_CHANNEL: usize = 5_760;
 
 #[derive(Default)]
@@ -98,6 +99,7 @@ fn run(shared: &Shared, output: &AudioOut) {
     let mut pcm = vec![0i16; MAX_FRAME_SAMPLES_PER_CHANNEL * 2];
     let mut consecutive_errors = 0u32;
     let (mut underruns, mut backlog_drops) = (0u64, 0u64);
+    let mut upmixed = Vec::with_capacity(pcm.len() * 2);
     let mut last_report = std::time::Instant::now();
     output.clear();
     loop {
@@ -143,23 +145,29 @@ fn run(shared: &Shared, output: &AudioOut) {
         match opus.decode(&packet.data, &mut pcm, false) {
             Ok(samples_per_channel) => {
                 consecutive_errors = 0;
-                if output.queued_ms() > MAX_OUTPUT_BACKLOG_MS {
+                let queued_ms = output.queued_ms();
+                if queued_ms > MAX_OUTPUT_BACKLOG_MS {
                     backlog_drops += 1;
                     shared.dropped(1);
                     continue;
                 }
-                if output.queued_ms() == 0 {
+                if queued_ms == 0 {
                     underruns += 1;
-                    let cushion = vec![0i16; (SAMPLE_RATE * CUSHION_MS / 1000) as usize * 2];
-                    let _ = output.queue(&cushion);
+                    let _ = output.queue(&CUSHION);
                 }
                 if last_report.elapsed() >= std::time::Duration::from_secs(10) {
                     eprintln!("audio: underruns={underruns} backlog-drops={backlog_drops} queued={}ms", output.queued_ms());
                     last_report = std::time::Instant::now();
                 }
                 let samples = samples_per_channel * usize::from(*channels);
-                let block = if *channels == 1 { upmix(&pcm[..samples]) } else { pcm[..samples].to_vec() };
-                if let Err(message) = output.queue(&block) {
+                let block = if *channels == 1 {
+                    upmixed.clear();
+                    upmixed.extend(pcm[..samples].iter().flat_map(|&s| [s, s]));
+                    &upmixed[..]
+                } else {
+                    &pcm[..samples]
+                };
+                if let Err(message) = output.queue(block) {
                     let _ = shared.feedback.send(MediaFeedback::OutputError { message });
                 }
             }
@@ -172,8 +180,4 @@ fn run(shared: &Shared, output: &AudioOut) {
             }
         }
     }
-}
-
-fn upmix(mono: &[i16]) -> Vec<i16> {
-    mono.iter().flat_map(|&s| [s, s]).collect()
 }

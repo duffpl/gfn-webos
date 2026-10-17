@@ -116,6 +116,7 @@ impl VideoDecoder for StarfishDecoder {
         if result == FeedResult::BufferFull {
             self.stats.full += 1;
         }
+        let mut pipeline_error = None;
         for event in self.video.events().try_iter() {
             match event {
                 Event::FrameReady { pts } => {
@@ -128,13 +129,18 @@ impl VideoDecoder for StarfishDecoder {
                     stats.lag_samples += 1;
                     sample_lag(&mut self.lag_window, lag);
                 }
-                Event::Error { code, message } => return Err(format!("pipeline error {code}: {message}")),
+                Event::Error { code, message } => {
+                    pipeline_error.get_or_insert(format!("pipeline error {code}: {message}"));
+                }
                 Event::Other { kind: 47, num, .. } => self.stats.sink_displayed += num,
                 Event::Other { kind: 46, num, .. } => self.stats.sink_dropped += num,
                 Event::Other { .. } => {}
             }
         }
         self.stats.report(self.presented);
+        if let Some(error) = pipeline_error {
+            return Err(error);
+        }
         match result {
             FeedResult::Accepted => Ok(Decoded::Accepted),
             FeedResult::BufferFull => Ok(Decoded::Skipped),

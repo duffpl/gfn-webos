@@ -27,7 +27,7 @@ mod ui;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{SendError, Sender, channel};
 
 use gfn_input::evdev::PadEvent;
 use gfn_input::{InputCapture, Pointer};
@@ -36,11 +36,36 @@ use gfn_sink::{AudioOut, SinkBackend, create_runtime};
 
 pub const TV: bool = cfg!(all(target_os = "linux", target_arch = "arm"));
 
+/// The main loop's sleep during a TV stream: the controller keepalive interval.
+const STREAM_WAIT_MS: u32 = 100;
+
 pub enum Update {
     Account(account::Progress),
     Art { url: String, pixels: Option<art::Pixels> },
     Bluetooth(bluetooth::Snapshot),
     Session(session::Progress),
+}
+
+/// The UI thread's inbox. Each send also wakes the main loop, which can then sleep for long
+/// stretches during a stream instead of polling the channel.
+#[derive(Clone)]
+pub struct Updates {
+    tx: Sender<Update>,
+    waker: Option<gfn_sdl::Waker>,
+}
+
+impl Updates {
+    pub fn new(tx: Sender<Update>, waker: Option<gfn_sdl::Waker>) -> Self {
+        Self { tx, waker }
+    }
+
+    pub fn send(&self, update: Update) -> Result<(), SendError<Update>> {
+        self.tx.send(update)?;
+        if let Some(waker) = self.waker {
+            waker.wake();
+        }
+        Ok(())
+    }
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -192,6 +217,7 @@ fn run(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("installing the Ctrl+C handler: {e}"))?;
 
     let (updates_tx, updates) = channel();
+    let updates_tx = Updates::new(updates_tx, Some(gfn_sdl::Waker::new(&sdl)));
     let (art_tx, art_rx) = channel();
     let preview = flag(args, "--preview");
     if preview.is_none() {
@@ -220,14 +246,31 @@ fn run(args: &[String]) -> Result<(), String> {
             app.request_quit();
         }
         // Idle screens sleep in SDL until input arrives; a live simulator stream wakes for each
-        // decoded picture instead (below), so it only peeks at the queue here.
-        let idle_wait = if app.is_streaming() && frames.is_some() { 0 } else { 8 };
+        // decoded picture instead (below), so it only peeks at the queue here. A TV stream draws
+        // nothing per frame and every other thread wakes this one, so it sleeps until the next
+        // controller keepalive, leaving the CPU to the video, audio and network threads.
+        let idle_wait = match (app.is_streaming(), frames.is_some()) {
+            (true, true) => 0,
+            (true, false) if TV => STREAM_WAIT_MS,
+            _ => 8,
+        };
         let mut next = if idle_wait == 0 { gfn_sdl::poll_event() } else { gfn_sdl::wait_event(idle_wait) };
         while let Some(event) = next {
             match event {
                 Some(InputEvent::Quit) => {
                     quit.store(true, Ordering::Relaxed);
                     app.request_quit();
+                }
+                Some(InputEvent::Background) => {
+                    gfn_sink::set_backgrounded(true);
+                    app.event(InputEvent::FocusLost, &mut input, &window);
+                }
+                Some(InputEvent::Foreground) => {
+                    gfn_sink::set_backgrounded(false);
+                    app.event(InputEvent::FocusGained, &mut input, &window);
+                    // The compositor may have dropped the pointer mode and our last frame.
+                    apply_pointer(&mut window, &mut cursors, &mut input, pointer);
+                    app.mark_dirty();
                 }
                 Some(InputEvent::ControllerAdded { .. }) if TV => {}
                 Some(InputEvent::ControllerAdded { device_index }) => {
@@ -269,7 +312,7 @@ fn run(args: &[String]) -> Result<(), String> {
         app.poll_keyboard(&window);
         let wanted = if app.stream_has_input() { input.pointer() } else { Pointer::Free };
         if wanted != pointer {
-            apply_pointer(&mut window, &mut cursors, wanted);
+            apply_pointer(&mut window, &mut cursors, &mut input, wanted);
             pointer = wanted;
         }
         if app.take_video_reset() {
@@ -285,10 +328,15 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_pointer(window: &mut gfn_sdl::Window, cursors: &mut SystemCursors, pointer: Pointer) {
-    let relative = pointer == Pointer::Relative;
+fn apply_pointer(window: &mut gfn_sdl::Window, cursors: &mut SystemCursors, input: &mut InputCapture, pointer: Pointer) {
+    let mut relative = pointer == Pointer::Relative && input.relative_available();
     if let Err(error) = window.set_relative_mouse(relative) {
         eprintln!("{error}");
+        if relative {
+            input.set_relative_unavailable();
+            let _ = window.set_relative_mouse(false);
+            relative = false;
+        }
     }
     if !relative {
         gfn_sdl::show_cursor(true);

@@ -10,12 +10,13 @@
 mod payload;
 mod sys;
 
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_long, c_uint};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 pub use payload::{LoadPayload, VideoCodec};
@@ -50,7 +51,8 @@ pub enum FeedResult {
 pub enum Event {
     FrameReady { pts: i64 },
     Error { code: i64, message: String },
-    Other { kind: c_int, num: i64, message: String },
+    /// Everything else; the message is logged where it arrives, so it is not carried.
+    Other { kind: c_int, num: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +82,16 @@ struct SessionState {
     media_id: Option<CString>,
     source_info: Option<CString>,
     frames: u64,
-    events: Option<Sender<Event>>,
+    events: Option<SyncSender<Event>>,
 }
 
 static SESSION: Mutex<Option<SessionState>> = Mutex::new(None);
 static NEXT_EPOCH: AtomicU32 = AtomicU32::new(1);
+/// Pipeline events held for `decode`: a few seconds of frame-ready and quality reports.
+const EVENT_BACKLOG: usize = 512;
+/// A quarantined object blocks every later Load in the native layer for the life of the process;
+/// remembered so the refusal can say that only a restart helps.
+static QUARANTINED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -143,7 +150,7 @@ impl StarfishVideo {
         }
 
         let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(EVENT_BACKLOG);
         *lock_session() = Some(SessionState { epoch, events: Some(tx), ..Default::default() });
 
         let json = config.payload.to_json(&config.app_id, window_id.as_deref());
@@ -160,6 +167,9 @@ impl StarfishVideo {
             _not_send: PhantomData,
         };
         if unsafe { sys::sf_load(json.as_ptr(), epoch) } == 0 {
+            if QUARANTINED.load(Ordering::Relaxed) {
+                return Err("The TV's video player could not be released after the last stream. Restart the app to play again.".into());
+            }
             return Err("StarfishMediaAPIs::Load refused".into());
         }
         eprintln!("starfish: load returned");
@@ -295,6 +305,8 @@ impl Drop for StarfishVideo {
             }
             if !(gate_proven && unload_completed) || unsafe { sys::sf_destroy() } == 0 {
                 unsafe { sys::sf_quarantine() };
+                QUARANTINED.store(true, Ordering::Relaxed);
+                eprintln!("starfish: quarantined (gate proven={gate_proven}, unload completed={unload_completed})");
             }
         }
         unsafe { sys::vp_destroy_window() };
@@ -343,10 +355,12 @@ fn on_pipeline_event(epoch: c_uint, kind: c_int, num: i64, message: &str) {
     let event = match kind {
         CB_FRAME_READY => Event::FrameReady { pts: num },
         CB_ERROR => Event::Error { code: num, message: message.to_owned() },
-        _ => Event::Other { kind, num, message: message.to_owned() },
+        _ => Event::Other { kind, num },
     };
     if let Some(events) = &state.events {
-        let _ = events.send(event);
+        // Only `decode` drains this; while the stream is paused nothing does, and the oldest
+        // undrained events are worth least, so the newest are what is dropped once it is full.
+        let _ = events.try_send(event);
     }
 }
 
@@ -354,11 +368,7 @@ fn on_pipeline_event(epoch: c_uint, kind: c_int, num: i64, message: &str) {
 #[unsafe(no_mangle)]
 pub extern "C" fn sf_on_event(epoch: c_uint, kind: c_int, num: i64, message: *const c_char) {
     let _ = std::panic::catch_unwind(|| {
-        let message = if message.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned()
-        };
+        let message = if message.is_null() { Cow::Borrowed("") } else { unsafe { CStr::from_ptr(message) }.to_string_lossy() };
         on_pipeline_event(epoch, kind, num, &message);
     });
 }
@@ -374,9 +384,13 @@ pub extern "C" fn acb_on_event(event: c_long, reply: *const c_char) {
 mod tests {
     use super::*;
 
+    /// The tests share the process-wide session.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn events_for_a_retired_epoch_are_ignored() {
-        let (tx, rx) = channel();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, rx) = sync_channel(EVENT_BACKLOG);
         *lock_session() = Some(SessionState { epoch: 7, events: Some(tx), ..Default::default() });
         on_pipeline_event(6, CB_FRAME_READY, 1, "");
         on_pipeline_event(7, CB_FRAME_READY, 2, "");
@@ -387,7 +401,8 @@ mod tests {
 
     #[test]
     fn captures_media_id_and_source_info_verbatim() {
-        let (tx, _rx) = channel();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, _rx) = sync_channel(EVENT_BACKLOG);
         *lock_session() = Some(SessionState { epoch: 9, events: Some(tx), ..Default::default() });
         let info = r#"{"sourceInfo":{"context":"_abc123","video":{"width":1920}}}"#;
         on_pipeline_event(9, 5, 0, info);

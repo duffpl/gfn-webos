@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use gfn_luna::Reply;
 use serde_json::{Value, json};
 
-use crate::Update;
+use crate::{Update, Updates};
 
 const SERVICE: &str = "luna://com.webos.service.bluetooth2";
 /// Long enough for a controller to show up, short enough not to keep the radio busy (it shares
@@ -23,7 +23,12 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
 /// Paired controllers that are off are retried this often while no stream runs: a controller
 /// switched on later may wait for the TV to connect to it rather than connect itself.
 const RECONNECT_EVERY: Duration = Duration::from_secs(15);
+/// Housekeeping cadence while something is in flight (a search, a pairing, a scripted reply).
 const TICK: Duration = Duration::from_millis(50);
+/// Otherwise nothing changes between replies but the reconnect timer, so the worker mostly sleeps.
+const IDLE_TICK: Duration = Duration::from_secs(1);
+/// A reply on no call: sent after each command to wake the worker out of its idle wait.
+const WAKE: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -75,23 +80,27 @@ impl Snapshot {
     }
 }
 
-pub struct Handle(Sender<Command>);
+pub struct Handle {
+    commands: Sender<Command>,
+    wake: Sender<Reply>,
+}
 
 impl Handle {
     pub fn send(&self, command: Command) {
-        let _ = self.0.send(command);
+        let _ = self.commands.send(command);
+        let _ = self.wake.send(Reply { call: WAKE, payload: Value::Null });
     }
 }
 
-pub fn start(updates: Sender<Update>) -> Handle {
+pub fn start(updates: Updates) -> Handle {
     let (commands_tx, commands) = channel();
     let (replies_tx, replies) = channel();
-    let bus = open_bus(replies_tx);
+    let bus = open_bus(replies_tx.clone());
     std::thread::Builder::new()
         .name("bluetooth".into())
         .spawn(move || run(bus, &replies, &commands, &updates))
         .expect("spawning the bluetooth thread");
-    Handle(commands_tx)
+    Handle { commands: commands_tx, wake: replies_tx }
 }
 
 fn open_bus(replies: Sender<Reply>) -> Result<Box<dyn Bus>, String> {
@@ -105,7 +114,7 @@ fn open_bus(replies: Sender<Reply>) -> Result<Box<dyn Bus>, String> {
     }
 }
 
-fn run(bus: Result<Box<dyn Bus>, String>, replies: &Receiver<Reply>, commands: &Receiver<Command>, updates: &Sender<Update>) {
+fn run(bus: Result<Box<dyn Bus>, String>, replies: &Receiver<Reply>, commands: &Receiver<Command>, updates: &Updates) {
     let mut worker = match bus {
         Ok(bus) => Worker::new(bus),
         Err(error) => {
@@ -118,7 +127,7 @@ fn run(bus: Result<Box<dyn Bus>, String>, replies: &Receiver<Reply>, commands: &
     };
     let mut last = None;
     loop {
-        match replies.recv_timeout(TICK) {
+        match replies.recv_timeout(if worker.busy() { TICK } else { IDLE_TICK }) {
             Ok(reply) => worker.reply(reply),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -147,6 +156,10 @@ trait Bus: Send {
     fn cancel(&mut self, call: u64);
     /// Lets a scripted bus deliver what is due.
     fn tick(&mut self) {}
+    /// Whether a scripted bus has replies waiting for `tick`.
+    fn scripted_pending(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(feature = "sim"))]
@@ -213,6 +226,10 @@ struct Worker {
 }
 
 impl Worker {
+    fn busy(&self) -> bool {
+        self.searching.is_some() || !self.ops.is_empty() || self.bus.scripted_pending()
+    }
+
     fn new(mut bus: Box<dyn Bus>) -> Self {
         let status = bus.call(&format!("{SERVICE}/device/getStatus"), json!({ "subscribe": true }));
         Self {
@@ -392,6 +409,9 @@ impl Worker {
         for address in done {
             self.ops.remove(&address);
         }
+        // A quiet reconnect can succeed after an earlier attempt failed.
+        let known = &self.known;
+        self.failures.retain(|address, _| !known.iter().any(|k| &k.address == address && k.connected));
     }
 
     fn housekeep(&mut self, now: Instant) {
@@ -639,6 +659,10 @@ mod fake {
         }
 
         fn cancel(&mut self, _: u64) {}
+
+        fn scripted_pending(&self) -> bool {
+            !self.due.is_empty()
+        }
 
         fn tick(&mut self) {
             let now = Instant::now();

@@ -2,16 +2,16 @@
 //! `artwork.ready` event when it was not cached yet); this thread decodes it, crops it to the tile
 //! and rounds its corners, so the UI thread only uploads finished pixels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use gfn_core_client::CoreClient;
 use image::imageops::FilterType;
 use serde_json::json;
 
-use crate::Update;
+use crate::{Update, Updates};
 
 pub struct Pixels {
     pub width: u32,
@@ -28,64 +28,105 @@ pub struct Job {
 
 pub enum Message {
     Want(Job),
+    /// The artwork on screen now. Queued work for anything else is dropped, so a fast scroll does
+    /// not leave a backlog of tiles that were only passed over.
+    Visible(HashSet<String>),
     /// From the core's `artwork.ready` event; `None` when the download failed.
     Ready { url: String, path: Option<String> },
 }
 
 const RETRY: Duration = Duration::from_millis(750);
 
-pub fn spawn(core: Arc<CoreClient>, messages: Receiver<Message>, updates: Sender<Update>) {
+/// Work for this thread, kept to what is on screen.
+#[derive(Default)]
+struct Pending {
+    queue: VecDeque<Job>,
+    /// Being downloaded by the core, which sends `artwork.ready` when done.
+    waiting: HashMap<String, Job>,
+    retry: Vec<(Instant, Job)>,
+}
+
+impl Pending {
+    fn want(&mut self, job: Job) {
+        let url = job.url.as_str();
+        let known = self.queue.iter().any(|j| j.url == url)
+            || self.waiting.contains_key(url)
+            || self.retry.iter().any(|(_, j)| j.url == url);
+        if !known {
+            self.queue.push_back(job);
+        }
+    }
+
+    /// A download already started still finishes into the core's cache; only its decode is
+    /// skipped, and scrolling back finds it cached.
+    fn keep_only(&mut self, visible: &HashSet<String>) {
+        self.queue.retain(|job| visible.contains(&job.url));
+        self.waiting.retain(|url, _| visible.contains(url));
+        self.retry.retain(|(_, job)| visible.contains(&job.url));
+    }
+
+    fn next(&mut self) -> Option<Job> {
+        let (due, later): (Vec<_>, Vec<_>) = self.retry.drain(..).partition(|(at, _)| at.elapsed() >= RETRY);
+        self.retry = later;
+        self.queue.extend(due.into_iter().map(|(_, job)| job));
+        self.queue.pop_front()
+    }
+
+    fn idle(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+pub fn spawn(core: Arc<CoreClient>, messages: Receiver<Message>, updates: Updates) {
     let worker = move || {
-        let mut waiting: HashMap<String, Job> = HashMap::new();
-        let mut retry: Vec<(Instant, Job)> = Vec::new();
+        let mut pending = Pending::default();
         loop {
-            let message = match messages.recv_timeout(RETRY) {
+            // Every message is read before each job, so a scroll's Visible lands before the
+            // jobs it makes stale are worked on.
+            let first = match messages.recv_timeout(if pending.idle() { RETRY } else { Duration::ZERO }) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
             };
-            let (expired, later): (Vec<_>, Vec<_>) = retry.drain(..).partition(|(at, _)| at.elapsed() >= RETRY);
-            retry = later;
-            let mut due: Vec<Job> = expired.into_iter().map(|(_, job)| job).collect();
-            match message {
-                Some(Message::Want(job)) => due.push(job),
-                Some(Message::Ready { url, path }) => {
-                    if let Some(job) = waiting.remove(&url) {
-                        let pixels = path.and_then(|path| load(&path, &job));
-                        if updates.send(Update::Art { url, pixels }).is_err() {
-                            return;
+            for message in first.into_iter().chain(messages.try_iter()) {
+                match message {
+                    Message::Want(job) => pending.want(job),
+                    Message::Visible(visible) => pending.keep_only(&visible),
+                    Message::Ready { url, path } => {
+                        if let Some(job) = pending.waiting.remove(&url) {
+                            let pixels = path.and_then(|path| load(&path, &job));
+                            if updates.send(Update::Art { url, pixels }).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
-                None => {}
             }
-            for job in due {
-                let resolved = core.request("artwork.resolve", json!({"url": job.url}), Duration::from_secs(10));
-                let resolved = match resolved {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        eprintln!("artwork.resolve: {error}");
-                        let _ = updates.send(Update::Art { url: job.url, pixels: None });
-                        continue;
+            let Some(job) = pending.next() else { continue };
+            let resolved = match core.request("artwork.resolve", json!({"url": job.url}), Duration::from_secs(10)) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("artwork.resolve: {error}");
+                    let _ = updates.send(Update::Art { url: job.url, pixels: None });
+                    continue;
+                }
+            };
+            match resolved["status"].as_str() {
+                Some("ready") => {
+                    let pixels = resolved["filePath"].as_str().and_then(|path| load(path, &job));
+                    if updates.send(Update::Art { url: job.url, pixels }).is_err() {
+                        return;
                     }
-                };
-                match resolved["status"].as_str() {
-                    Some("ready") => {
-                        let pixels = resolved["filePath"].as_str().and_then(|path| load(path, &job));
-                        if updates.send(Update::Art { url: job.url, pixels }).is_err() {
-                            return;
-                        }
-                    }
-                    Some("pending") => {
-                        waiting.insert(job.url.clone(), job);
-                    }
-                    // A saturated download queue is temporary; ask again shortly.
-                    _ if matches!(resolved["fallbackReason"].as_str(), Some("queue-full" | "retry-later")) => {
-                        retry.push((Instant::now(), job));
-                    }
-                    _ => {
-                        let _ = updates.send(Update::Art { url: job.url, pixels: None });
-                    }
+                }
+                Some("pending") => {
+                    pending.waiting.insert(job.url.clone(), job);
+                }
+                // A saturated download queue is temporary; ask again shortly.
+                _ if matches!(resolved["fallbackReason"].as_str(), Some("queue-full" | "retry-later")) => {
+                    pending.retry.push((Instant::now(), job));
+                }
+                _ => {
+                    let _ = updates.send(Update::Art { url: job.url, pixels: None });
                 }
             }
         }
@@ -133,6 +174,24 @@ fn round_corners(rgba: &mut [u8], width: u32, height: u32, radius: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(url: &str) -> Job {
+        Job { url: url.into(), width: 1, height: 1, radius: 0 }
+    }
+
+    #[test]
+    fn scrolled_past_artwork_is_dropped_from_the_queue() {
+        let mut pending = Pending::default();
+        for url in ["a", "b", "c", "a"] {
+            pending.want(job(url));
+        }
+        pending.waiting.insert("w".into(), job("w"));
+        pending.keep_only(&HashSet::from(["c".to_owned(), "x".to_owned()]));
+        pending.want(job("x"));
+        let order: Vec<String> = std::iter::from_fn(|| pending.next()).map(|job| job.url).collect();
+        assert_eq!(order, ["c", "x"]);
+        assert!(pending.waiting.is_empty());
+    }
 
     #[test]
     fn corners_are_cut_and_the_middle_kept() {

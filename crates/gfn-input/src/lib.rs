@@ -54,6 +54,7 @@ pub struct InputCapture {
     always_captured: bool,
     focused: bool,
     stream_size: (u32, u32),
+    relative_available: bool,
     pressed_keys: HashMap<i32, u16>,
     pressed_buttons: u8,
     /// A Ctrl+Alt release swallows the matching key-ups so the game never sees half a chord.
@@ -72,6 +73,7 @@ impl InputCapture {
             always_captured,
             focused: always_captured,
             stream_size: (1920, 1080),
+            relative_available: true,
             pressed_keys: HashMap::new(),
             pressed_buttons: 0,
             swallowed: Vec::new(),
@@ -83,6 +85,16 @@ impl InputCapture {
 
     pub fn set_stream_size(&mut self, width: u32, height: u32) {
         self.stream_size = (width.max(1), height.max(1));
+    }
+
+    /// webOS's SDL has no relative mode and the Magic Remote is an absolute pointer: deltas from
+    /// it stop at the screen edge and drift from the game's cursor, so positions are sent instead.
+    pub fn set_relative_unavailable(&mut self) {
+        self.relative_available = false;
+    }
+
+    pub fn relative_available(&self) -> bool {
+        self.relative_available
     }
 
     pub fn is_captured(&self) -> bool {
@@ -202,7 +214,11 @@ impl InputCapture {
             InputEvent::FocusLost => {
                 self.release_all();
                 self.focused = false;
-                self.captured = false;
+                // The TV never waits for a capturing click, so input must come back with focus
+                // after the keyboard panel or a system overlay.
+                if !self.always_captured {
+                    self.captured = false;
+                }
             }
             InputEvent::Key { scancode, modifiers, pressed, repeat, .. } => self.key(scancode, modifiers, pressed, repeat),
             InputEvent::MouseMotion { x, y, xrel, yrel } => self.motion(x, y, xrel, yrel, window_size),
@@ -259,19 +275,26 @@ impl InputCapture {
     fn motion(&mut self, x: i32, y: i32, xrel: i32, yrel: i32, window_size: (u32, u32)) {
         match self.pointer() {
             Pointer::Free => {}
-            Pointer::Relative if xrel != 0 || yrel != 0 => {
-                self.queue.push(CapturedInput::MouseMove { delta_x: clamp_i16(xrel), delta_y: clamp_i16(yrel) });
+            Pointer::Relative if self.relative_available => {
+                if xrel != 0 || yrel != 0 {
+                    self.queue.push(CapturedInput::MouseMove { delta_x: clamp_i16(xrel), delta_y: clamp_i16(yrel) });
+                }
             }
-            Pointer::Relative => {}
-            Pointer::Absolute { .. } => {
+            Pointer::Relative | Pointer::Absolute { .. } => {
                 let (stream_w, stream_h) = self.stream_size;
                 let (left, top, width, height) = gfn_sdl::letterbox_rect(stream_w, stream_h, window_size.0, window_size.1);
                 let (width, height) = (width.max(1), height.max(1));
+                // The server places the cursor at x/y in stream pixels and ignores the reference
+                // size, so a 1080p window on a 1440p stream reached only the top-left 1920x1080.
+                let scale = |offset: i32, extent: u32, stream: u32| {
+                    let offset = i64::from(offset.clamp(0, extent as i32 - 1));
+                    (offset * i64::from(stream) / i64::from(extent)).min(i64::from(u16::MAX)) as u16
+                };
                 self.queue.push(CapturedInput::MouseAbsolute {
-                    x: (x - left).clamp(0, width as i32 - 1) as u16,
-                    y: (y - top).clamp(0, height as i32 - 1) as u16,
-                    width: width.min(u32::from(u16::MAX)) as u16,
-                    height: height.min(u32::from(u16::MAX)) as u16,
+                    x: scale(x - left, width, stream_w),
+                    y: scale(y - top, height, stream_h),
+                    width: stream_w.min(u32::from(u16::MAX)) as u16,
+                    height: stream_h.min(u32::from(u16::MAX)) as u16,
                 });
             }
         }
@@ -405,7 +428,7 @@ mod tests {
         input.handle(InputEvent::MouseMotion { x: 640, y: 360, xrel: 3, yrel: -2 }, WINDOW);
         assert_eq!(
             drain(&queue),
-            vec![CapturedInput::MouseAbsolute { x: 640, y: 360, width: 1280, height: 720 }]
+            vec![CapturedInput::MouseAbsolute { x: 960, y: 540, width: 1920, height: 1080 }]
         );
         cursor.apply(&[0, 0]);
         assert_eq!(input.pointer(), Pointer::Relative);
@@ -417,7 +440,39 @@ mod tests {
     fn absolute_positions_are_relative_to_the_letterboxed_picture() {
         let (mut input, queue, _) = capture(true);
         input.handle(InputEvent::MouseMotion { x: 500, y: 0, xrel: 0, yrel: 0 }, (1000, 1000));
-        assert_eq!(drain(&queue), vec![CapturedInput::MouseAbsolute { x: 500, y: 0, width: 1000, height: 562 }]);
+        assert_eq!(drain(&queue), vec![CapturedInput::MouseAbsolute { x: 960, y: 0, width: 1920, height: 1080 }]);
+    }
+
+    #[test]
+    fn always_captured_input_returns_with_focus() {
+        let (mut input, queue, _) = capture(true);
+        input.handle(InputEvent::FocusLost, WINDOW);
+        assert!(!input.is_captured());
+        input.handle(InputEvent::FocusGained, WINDOW);
+        assert!(input.is_captured());
+        drain(&queue);
+        input.handle(key(26, 0, true), WINDOW);
+        assert!(!drain(&queue).is_empty());
+    }
+
+    #[test]
+    fn hidden_cursor_gets_positions_when_relative_mode_is_unavailable() {
+        let (mut input, queue, cursor) = capture(true);
+        input.set_relative_unavailable();
+        cursor.apply(&[0, 0]);
+        assert_eq!(input.pointer(), Pointer::Relative);
+        input.handle(InputEvent::MouseMotion { x: 0, y: 0, xrel: -5, yrel: -5 }, WINDOW);
+        assert_eq!(drain(&queue), vec![CapturedInput::MouseAbsolute { x: 0, y: 0, width: 1920, height: 1080 }]);
+    }
+
+    #[test]
+    fn absolute_positions_cover_a_stream_larger_than_the_window() {
+        let (mut input, queue, _) = capture(true);
+        input.set_stream_size(2560, 1440);
+        input.handle(InputEvent::MouseMotion { x: 1919, y: 1079, xrel: 0, yrel: 0 }, (1920, 1080));
+        assert_eq!(drain(&queue), vec![CapturedInput::MouseAbsolute { x: 2558, y: 1438, width: 2560, height: 1440 }]);
+        input.handle(InputEvent::MouseMotion { x: 960, y: 540, xrel: 0, yrel: 0 }, (1920, 1080));
+        assert_eq!(drain(&queue), vec![CapturedInput::MouseAbsolute { x: 1280, y: 720, width: 2560, height: 1440 }]);
     }
 
     fn text_of(input: &CapturedInput) -> Option<&str> {

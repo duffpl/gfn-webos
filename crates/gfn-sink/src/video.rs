@@ -3,7 +3,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opennow_streamer_platform_webos::{EncodedFrame, MediaFeedback, MediaStreamConfig, PushOutcome};
 
@@ -120,7 +120,7 @@ impl VideoPipeline {
             .spawn(move || match factory(&config) {
                 Ok(decoder) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(backend, &worker_shared, decoder, &config);
+                    run(backend, &worker_shared, factory.as_ref(), decoder, &config);
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -193,9 +193,26 @@ impl VideoPipeline {
     }
 }
 
-fn run(backend: &'static str, shared: &Shared, mut decoder: Box<dyn VideoDecoder>, config: &MediaStreamConfig) {
+/// How often a closed decoder is reopened; the TV may hand the video resources back a little
+/// after the app is in front again.
+const REOPEN_RETRY: Duration = Duration::from_millis(500);
+/// A decoder error ends the session (the core reports it as a stream error), so it is reported
+/// only once reopening has kept failing this long.
+const REOPEN_GIVE_UP: Duration = Duration::from_secs(10);
+
+fn run(
+    backend: &'static str,
+    shared: &Shared,
+    factory: &DecoderFactory,
+    decoder: Box<dyn VideoDecoder>,
+    config: &MediaStreamConfig,
+) {
     let codec = config.codec.label();
     let mut started = false;
+    let mut decoder = Some(decoder);
+    let mut last_reopen: Option<Instant> = None;
+    // Since when the decoder has been needed but missing, and the error that took it away.
+    let mut broken: Option<(Instant, String)> = None;
     loop {
         let (frame, queued_at) = {
             let mut state = shared.lock();
@@ -204,6 +221,12 @@ fn run(backend: &'static str, shared: &Shared, mut decoder: Box<dyn VideoDecoder
                     return;
                 }
                 if let Some((frame, queued_at)) = state.frames.pop_front() {
+                    // Frames while backgrounded are discarded unreported: they are not losses the
+                    // server should adapt its bitrate to.
+                    if crate::backgrounded() || decoder.is_none() {
+                        state.awaiting_keyframe = true;
+                        break (frame, queued_at);
+                    }
                     if state.awaiting_keyframe && !frame.keyframe {
                         shared.dropped(1);
                         continue;
@@ -214,8 +237,45 @@ fn run(backend: &'static str, shared: &Shared, mut decoder: Box<dyn VideoDecoder
                 state = shared.wake.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
+        if crate::backgrounded() {
+            if decoder.take().is_some() {
+                eprintln!("video: app in background, {backend} decoder closed");
+            }
+            broken = None;
+            continue;
+        }
+        if decoder.is_none() {
+            let (since, _) = broken.get_or_insert_with(|| (Instant::now(), "decoder closed in background".into()));
+            let since = *since;
+            if last_reopen.is_some_and(|at| at.elapsed() < REOPEN_RETRY) {
+                continue;
+            }
+            last_reopen = Some(Instant::now());
+            match factory(config) {
+                Ok(reopened) => {
+                    eprintln!("video: {backend} decoder reopened");
+                    decoder = Some(reopened);
+                    broken = None;
+                }
+                Err(message) => {
+                    if since.elapsed() >= REOPEN_GIVE_UP {
+                        let cause = broken.take().map(|(_, cause)| cause).unwrap_or_default();
+                        let message = format!("{cause}; reopening failed: {message}");
+                        let _ = shared.feedback.send(MediaFeedback::DecoderError { codec, message });
+                    }
+                    continue;
+                }
+            }
+            if !frame.keyframe {
+                // awaiting_keyframe is still set, so the queue skips to the keyframe asked for here.
+                shared.request_keyframe(&frame.mid, "decoder reopened");
+                continue;
+            }
+            shared.lock().awaiting_keyframe = false;
+        }
+        let Some(active) = decoder.as_mut() else { continue };
         let decode_started = Instant::now();
-        let decoded = decoder.decode(&frame);
+        let decoded = active.decode(&frame);
         let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         shared.stats.record(nanos(decode_started - queued_at), nanos(decode_started.elapsed()));
         match decoded {
@@ -233,12 +293,18 @@ fn run(backend: &'static str, shared: &Shared, mut decoder: Box<dyn VideoDecoder
                 });
             }
             Err(message) => {
-                let _ = shared.feedback.send(MediaFeedback::DecoderError { codec, message });
+                // Reported only if reopening fails too: a fresh pipeline usually recovers, and the
+                // report would end the session.
+                eprintln!("video: {backend} decoder failed, reopening: {message}");
                 shared.lock().awaiting_keyframe = true;
-                shared.request_keyframe(&frame.mid, "decoder rejected access unit");
+                broken = Some((Instant::now(), message));
             }
         }
-        if !started && decoder.presented_frames() > 0 {
+        if broken.is_some() {
+            decoder = None;
+            continue;
+        }
+        if !started && active.presented_frames() > 0 {
             started = true;
             let _ = shared.feedback.send(MediaFeedback::PlaybackStarted { backend });
         }
@@ -365,6 +431,49 @@ mod tests {
         video.stop();
         assert!(feedback.try_iter().any(|e| matches!(e, MediaFeedback::RequestKeyframe { .. })));
         assert_eq!(*decoded.lock().unwrap(), vec![1]);
+    }
+
+    /// Fails on frame 2, as a dead Starfish pipeline would.
+    struct Failing(Arc<Mutex<Vec<u32>>>);
+
+    impl VideoDecoder for Failing {
+        fn decode(&mut self, frame: &EncodedFrame) -> Result<Decoded, String> {
+            let index = frame.frame_index.unwrap();
+            if index == 2 {
+                return Err("pipeline error".into());
+            }
+            self.0.lock().unwrap().push(index);
+            Ok(Decoded::Accepted)
+        }
+        fn presented_frames(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_failed_decoder_is_reopened_without_ending_the_session() {
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let opens = Arc::new(AtomicU64::new(0));
+        let (sink, counter) = (Arc::clone(&decoded), Arc::clone(&opens));
+        let factory: Arc<DecoderFactory> = Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(Failing(Arc::clone(&sink))) as Box<dyn VideoDecoder>)
+        });
+        let (tx, feedback) = channel();
+        let video = VideoPipeline::start("test", &MediaStreamConfig::default(), factory, tx, Arc::default()).unwrap();
+        video.push(frame(1, true));
+        settle(&decoded, 1);
+        video.push(frame(2, false));
+        video.push(frame(3, false));
+        video.push(frame(4, true));
+        video.push(frame(5, false));
+        settle(&decoded, 3);
+        video.stop();
+        assert_eq!(*decoded.lock().unwrap(), vec![1, 4, 5]);
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        let events: Vec<_> = feedback.try_iter().collect();
+        assert!(!events.iter().any(|e| matches!(e, MediaFeedback::DecoderError { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, MediaFeedback::RequestKeyframe { .. })), "{events:?}");
     }
 
     #[test]

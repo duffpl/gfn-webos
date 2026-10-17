@@ -7,8 +7,9 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tv="${GFN_TV:?set GFN_TV to the TV address}"
 key="${GFN_TV_KEY:-$HOME/.ssh/lgtv_webos}"
-id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$root/pkg/appinfo.json")"
-ipk="$(ls "$root"/build/"$id"_*_arm.ipk)"
+read -r id version < <(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); print(a["id"], a["version"])' "$root/pkg/appinfo.json")
+ipk="$root/build/${id}_${version}_arm.ipk"
+[[ -f "$ipk" ]] || { echo "no $ipk; run scripts/build-ipk.sh" >&2; exit 1; }
 
 ssh_tv() {
     ssh -i "$key" -p 9922 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \

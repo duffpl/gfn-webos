@@ -9,7 +9,7 @@ use std::time::Duration;
 use gfn_core_client::{CoreClient, CoreEvent, SpawnOptions};
 use serde_json::{Value, json};
 
-use crate::{Update, art, session::sleep_unless_quit};
+use crate::{Update, Updates, art, session::sleep_unless_quit};
 
 #[derive(Debug, Clone)]
 pub struct Game {
@@ -56,7 +56,7 @@ pub struct Config {
     pub verbose: bool,
 }
 
-pub fn start(config: Config, art: Receiver<art::Message>, art_tx: Sender<art::Message>, updates: Sender<Update>, quit: Arc<AtomicBool>) {
+pub fn start(config: Config, art: Receiver<art::Message>, art_tx: Sender<art::Message>, updates: Updates, quit: Arc<AtomicBool>) {
     let spawned = std::thread::Builder::new().name("gfn-account".into()).spawn({
         let updates = updates.clone();
         move || {
@@ -77,7 +77,7 @@ fn run(
     config: &Config,
     art: Receiver<art::Message>,
     art_tx: Sender<art::Message>,
-    updates: &Sender<Update>,
+    updates: &Updates,
     quit: &AtomicBool,
     send: &dyn Fn(Progress),
 ) -> Result<(), String> {

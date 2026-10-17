@@ -114,17 +114,20 @@ impl Fonts {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
-struct TextKey {
-    text: String,
-    px: u32,
-    bold: bool,
-}
-
 struct Cached {
     texture: Option<Texture>,
     used: u64,
 }
+
+impl Cached {
+    fn bytes(&self) -> usize {
+        self.texture.as_ref().map_or(0, |t| t.width as usize * t.height as usize * 4)
+    }
+}
+
+/// Rendered lines are kept while this many bytes of texture or fewer; one wide title line at 4K
+/// is about 1 MB, so this holds every line of several screens.
+const TEXT_BUDGET_BYTES: usize = 24 * 1024 * 1024;
 
 /// Window-bound drawing state: the scale, rendered text lines and anti-aliased corner masks.
 pub struct Painter {
@@ -132,14 +135,16 @@ pub struct Painter {
     scale: f32,
     offset: (f32, f32),
     frame: u64,
-    text: HashMap<TextKey, Cached>,
+    /// By (pixel size, bold), then by the line itself, so a hit is looked up without allocating.
+    text: HashMap<(u32, bool), HashMap<String, Cached>>,
+    text_bytes: usize,
     /// Anti-aliased discs by pixel radius; rounded rectangles draw their quadrants as corners.
     discs: HashMap<u32, Texture>,
 }
 
 impl Painter {
     pub fn new(fonts: Fonts) -> Self {
-        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), discs: HashMap::new() }
+        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), text_bytes: 0, discs: HashMap::new() }
     }
 
     /// Call before drawing a frame: picks up the current output size and evicts stale text.
@@ -148,10 +153,30 @@ impl Painter {
         self.scale = (w as f32 / CANVAS_W).min(h as f32 / CANVAS_H).max(0.01);
         self.offset = ((w as f32 - CANVAS_W * self.scale) / 2.0, (h as f32 - CANVAS_H * self.scale) / 2.0);
         self.frame += 1;
-        if self.text.len() > 400 {
-            let frame = self.frame;
-            self.text.retain(|_, cached| frame - cached.used < 120);
+        if self.text_bytes > TEXT_BUDGET_BYTES {
+            self.evict_text();
         }
+    }
+
+    /// Drops the least recently drawn lines until the cache is back to half its budget; lines
+    /// drawn in the last frame stay.
+    fn evict_text(&mut self) {
+        let mut by_age: Vec<(u64, usize)> =
+            self.text.values().flat_map(|lines| lines.values().map(|c| (c.used, c.bytes()))).collect();
+        by_age.sort_unstable();
+        let (mut bytes, mut cutoff) = (self.text_bytes, 0);
+        for (used, size) in by_age {
+            if bytes <= TEXT_BUDGET_BYTES / 2 || used + 1 >= self.frame {
+                break;
+            }
+            bytes -= size;
+            cutoff = used + 1;
+        }
+        for lines in self.text.values_mut() {
+            lines.retain(|_, cached| cached.used >= cutoff);
+        }
+        self.text.retain(|_, lines| !lines.is_empty());
+        self.text_bytes = self.text.values().flat_map(|lines| lines.values().map(Cached::bytes)).sum();
     }
 
     /// Output pixels per canvas unit.
@@ -234,15 +259,23 @@ impl Painter {
         if self.text_width(text, size, bold) <= max_width {
             return text.to_owned();
         }
-        let mut chars: Vec<char> = text.chars().collect();
-        while !chars.is_empty() {
-            chars.pop();
-            let candidate: String = chars.iter().collect::<String>().trim_end().to_owned() + "…";
-            if self.text_width(&candidate, size, bold) <= max_width {
-                return candidate;
+        let shortened = |chars: usize| {
+            let end = text.char_indices().nth(chars).map_or(text.len(), |(i, _)| i);
+            text[..end].trim_end().to_owned() + "…"
+        };
+        // Widths grow with the prefix, so the longest prefix that fits is found by bisection
+        // (this runs for every tile on every frame of a scroll).
+        let (mut fits, mut too_long) = (0, text.chars().count());
+        while too_long - fits > 1 {
+            let mid = (fits + too_long) / 2;
+            if self.text_width(&shortened(mid), size, bold) <= max_width {
+                fits = mid;
+            } else {
+                too_long = mid;
             }
         }
-        String::new()
+        let best = shortened(fits);
+        if fits == 0 && self.text_width(&best, size, bold) > max_width { String::new() } else { best }
     }
 
     /// One line of text whose box (ascent to descent) starts at canvas `y`.
@@ -251,14 +284,17 @@ impl Painter {
             return;
         }
         let px = (size * self.scale).round().max(1.0) as u32;
-        let key = TextKey { text: text.to_owned(), px, bold };
         let frame = self.frame;
         let (scale, offset) = (self.scale, self.offset);
-        let fonts = &self.fonts;
-        let cached = self.text.entry(key).or_insert_with(|| Cached {
-            texture: fonts.rasterize(text, px as f32, bold).and_then(|(w, h, pixels)| window.texture(w, h, &pixels).ok()),
-            used: frame,
-        });
+        let lines = self.text.entry((px, bold)).or_default();
+        if !lines.contains_key(text) {
+            let texture =
+                self.fonts.rasterize(text, px as f32, bold).and_then(|(w, h, pixels)| window.texture(w, h, &pixels).ok());
+            let cached = Cached { texture, used: frame };
+            self.text_bytes += cached.bytes();
+            lines.insert(text.to_owned(), cached);
+        }
+        let cached = lines.get_mut(text).expect("inserted above");
         cached.used = frame;
         let Some(texture) = cached.texture.as_ref() else { return };
         let width = texture.width as f32 / scale;
@@ -335,6 +371,19 @@ mod tests {
         let alpha = |x: u32, y: u32| pixels[((y * 16 + x) * 4 + 3) as usize];
         assert_eq!(alpha(8, 8), 255);
         assert_eq!(alpha(0, 0), 0);
+    }
+
+    #[test]
+    fn fit_keeps_the_longest_prefix_that_fits() {
+        let painter = Painter::new(Fonts::load().unwrap());
+        assert_eq!(painter.fit("Short", 26.0, false, 240.0), "Short");
+        let title = "The Elder Scrolls V: Skyrim Special Edition";
+        let fitted = painter.fit(title, 26.0, true, 240.0);
+        assert!(fitted.ends_with('…') && painter.text_width(&fitted, 26.0, true) <= 240.0, "{fitted}");
+        let kept = fitted.trim_end_matches('…').chars().count();
+        let next: String = title.chars().take(kept + 1).collect::<String>().trim_end().to_owned() + "…";
+        assert!(painter.text_width(&next, 26.0, true) > 240.0 || next == fitted, "{next}");
+        assert_eq!(painter.fit(title, 26.0, false, 1.0), "");
     }
 
     #[test]

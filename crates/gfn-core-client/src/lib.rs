@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,6 +23,7 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 const MIN_DEADLINE: Duration = Duration::from_millis(100);
 const MAX_DEADLINE: Duration = Duration::from_secs(300);
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 const REQUIRED_CAPABILITIES: [&str; 1] = ["queue.servers.v1"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +31,7 @@ pub enum Error {
     /// The core answered with `ok: false`.
     Rpc { code: String, message: String },
     Timeout,
+    Cancelled,
     Disconnected,
     Protocol(String),
     Io(String),
@@ -40,6 +42,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Rpc { code, message } => write!(f, "{code}: {message}"),
             Self::Timeout => f.write_str("request timed out"),
+            Self::Cancelled => f.write_str("request cancelled"),
             Self::Disconnected => f.write_str("core process disconnected"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
@@ -153,6 +156,13 @@ impl CoreClient {
     }
 
     pub fn request(&self, method: &str, params: Value, deadline: Duration) -> Reply {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        self.request_unless(method, params, deadline, &NEVER)
+    }
+
+    /// Like `request`, but gives up as soon as `cancel` is set and tells the core, which then
+    /// releases anything the request allocated (a cloud seat, for `session.create`).
+    pub fn request_unless(&self, method: &str, params: Value, deadline: Duration, cancel: &AtomicBool) -> Reply {
         let deadline_at = Instant::now() + deadline.clamp(MIN_DEADLINE, MAX_DEADLINE);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let message = json!({"type": "request", "id": id, "method": method, "params": params});
@@ -164,18 +174,23 @@ impl CoreClient {
                 self.lock_pending().remove(&id);
                 return Err(error);
             }
-            let remaining = deadline_at.saturating_duration_since(Instant::now());
-            let reply = match rx.recv_timeout(remaining) {
-                Ok(reply) => reply,
-                Err(RecvTimeoutError::Timeout) => {
-                    self.lock_pending().remove(&id);
-                    let _ = self.shared.write(&json!({"type": "cancel", "id": id}));
-                    return Err(Error::Timeout);
-                }
-                Err(RecvTimeoutError::Disconnected) => return Err(Error::Disconnected),
+            let reply = loop {
+                let remaining = deadline_at.saturating_duration_since(Instant::now());
+                let gave_up = match rx.recv_timeout(remaining.min(CANCEL_POLL)) {
+                    Ok(reply) => break reply,
+                    Err(RecvTimeoutError::Timeout) if cancel.load(Ordering::Relaxed) => Error::Cancelled,
+                    Err(RecvTimeoutError::Timeout) if remaining <= CANCEL_POLL => Error::Timeout,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return Err(Error::Disconnected),
+                };
+                self.lock_pending().remove(&id);
+                let _ = self.shared.write(&json!({"type": "cancel", "id": id}));
+                return Err(gave_up);
             };
             match reply {
-                Err(Error::Rpc { code, .. }) if code == "busy" && Instant::now() + retry_delay < deadline_at => {
+                Err(Error::Rpc { code, .. })
+                    if code == "busy" && Instant::now() + retry_delay < deadline_at && !cancel.load(Ordering::Relaxed) =>
+                {
                     thread::sleep(retry_delay);
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
                 }
@@ -281,6 +296,25 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), Err(Error::Rpc { code: "busy".into(), message: "later".into() }));
         assert_eq!(events_rx.recv().unwrap().name, "settings.changed");
         let _ = child.kill();
+    }
+
+    #[test]
+    fn cancelled_request_returns_promptly_and_tells_the_core() {
+        let mut child = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut sent = BufReader::new(child.stdout.take().unwrap());
+        let shared = Arc::new(Shared { stdin: Mutex::new(child.stdin.take()), pending: Mutex::new(HashMap::new()) });
+        let client = CoreClient { child, shared, next_id: AtomicU64::new(1), capabilities: Vec::new() };
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let reply = client.request_unless("session.create", json!({}), Duration::from_secs(60), &cancel);
+        assert_eq!(reply, Err(Error::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let mut lines = [String::new(), String::new()];
+        for line in &mut lines {
+            sent.read_line(line).unwrap();
+        }
+        let cancel: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(cancel, json!({"type": "cancel", "id": "1"}));
     }
 
     #[test]

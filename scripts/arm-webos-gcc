@@ -43,9 +43,10 @@ if [[ $stale == 1 ]]; then
     for src in "${sources[@]}"; do
         "${gcc[@]}" -mcpu=cortex-a9 -O2 -fPIC -D_GNU_SOURCE -std=gnu11 -c "$src" -o "$work/$(basename "${src%.c}").o"
     done
-    rm -f "$compat.tmp"
-    "$sdk/bin/arm-webos-linux-gnueabi-ar" rcs "$compat.tmp" "$work"/*.o
+    # gfn-app and gfn-probe link in parallel; each builds its archive in its own directory and the
+    # rename is atomic, so neither can remove the other's half-written file.
+    "$sdk/bin/arm-webos-linux-gnueabi-ar" rcs "$work/libgfncompat.a" "$work"/*.o
+    mv "$work/libgfncompat.a" "$compat"
     rm -rf "$work"
-    mv "$compat.tmp" "$compat"
 fi
 exec "${gcc[@]}" "$@" "$compat"

@@ -14,7 +14,7 @@ use opennow_streamer_core::Engine;
 use opennow_streamer_protocol::Command;
 use serde_json::{Value, json};
 
-use crate::Update;
+use crate::{Update, Updates};
 use crate::settings::StreamSettings;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -127,7 +127,7 @@ impl Handle {
     }
 }
 
-pub fn start(core: Arc<CoreClient>, runtime: MediaRuntime, launch: Launch, updates: Sender<Update>) -> Handle {
+pub fn start(core: Arc<CoreClient>, runtime: MediaRuntime, launch: Launch, updates: Updates) -> Handle {
     let quit = Arc::new(AtomicBool::new(false));
     let thread_quit = Arc::clone(&quit);
     let send = move |progress| {
@@ -137,7 +137,7 @@ pub fn start(core: Arc<CoreClient>, runtime: MediaRuntime, launch: Launch, updat
         let send = send.clone();
         move || {
             let outcome = run(&core, runtime, &launch, &thread_quit, &send);
-            send(Progress::Ended(outcome.err()));
+            send(Progress::Ended(outcome.err().filter(|error| error != CANCELLED)));
         }
     });
     if let Err(error) = spawned {
@@ -148,8 +148,19 @@ pub fn start(core: Arc<CoreClient>, runtime: MediaRuntime, launch: Launch, updat
 
 type Report<'a> = dyn Fn(Progress) + 'a;
 
+/// The error a request returns when the user ended the session while it was in flight; not shown.
+const CANCELLED: &str = "cancelled";
+
 fn run(core: &CoreClient, runtime: MediaRuntime, launch: &Launch, quit: &AtomicBool, send: &Report<'_>) -> Result<(), String> {
+    // Requests give up when the user ends the session, so Back never waits out a slow request;
+    // releasing the seat must not, so it gets its own.
     let call = |method: &str, params: Value, secs: u64| {
+        core.request_unless(method, params, Duration::from_secs(secs), quit).map_err(|e| match e {
+            gfn_core_client::Error::Cancelled => CANCELLED.to_owned(),
+            e => format!("{method}: {e}"),
+        })
+    };
+    let release = |method: &str, params: Value, secs: u64| {
         core.request(method, params, Duration::from_secs(secs)).map_err(|e| format!("{method}: {e}"))
     };
     let (events_tx, engine_events) = channel();
@@ -169,7 +180,7 @@ fn run(core: &CoreClient, runtime: MediaRuntime, launch: &Launch, quit: &AtomicB
         "supportsInGameSettingsPersistence": false, "appLaunchMode": "default",
         "runtimeCapabilities": capabilities, "maxEntitledFps": 0,
     });
-    let created = match core.request("session.create", request.clone(), Duration::from_secs(60)) {
+    let created = match core.request_unless("session.create", request.clone(), Duration::from_secs(60), quit) {
         Ok(created) => created,
         Err(gfn_core_client::Error::Rpc { code, .. }) if code == "session_conflict" => {
             match take_over_existing(&call, request, send)? {
@@ -187,7 +198,7 @@ fn run(core: &CoreClient, runtime: MediaRuntime, launch: &Launch, quit: &AtomicB
         }
         Err(error) => return Err(describe(&error)),
     };
-    let mut seat = Seat { call: &call, session: created["session"].clone(), stopped: false };
+    let mut seat = Seat { call: &call, release: &release, session: created["session"].clone(), stopped: false };
 
     let Some(ready_session) = seat.wait_until_ready(quit, send)? else { return seat.stop() };
     send(Progress::Status("Connecting".into()));
@@ -206,6 +217,7 @@ fn run(core: &CoreClient, runtime: MediaRuntime, launch: &Launch, quit: &AtomicB
 
 fn describe(error: &gfn_core_client::Error) -> String {
     match error {
+        gfn_core_client::Error::Cancelled => CANCELLED.to_owned(),
         gfn_core_client::Error::Rpc { message, .. } => message.clone(),
         other => other.to_string(),
     }
@@ -274,6 +286,7 @@ type Call<'a> = dyn Fn(&str, Value, u64) -> Result<Value, String> + 'a;
 /// `session.create` must release it; `Drop` is the backstop for early returns.
 struct Seat<'a> {
     call: &'a Call<'a>,
+    release: &'a Call<'a>,
     session: Value,
     stopped: bool,
 }
@@ -320,7 +333,7 @@ impl Seat<'_> {
             return Ok(());
         }
         let params = json!({"sessionId": self.id(), "streamingBaseUrl": self.session["streamingBaseUrl"]});
-        (self.call)("session.stop", params, 35).map(|_| ())
+        (self.release)("session.stop", params, 35).map(|_| ())
     }
 }
 

@@ -27,6 +27,13 @@ const AUDIO_S16LSB: u16 = 0x8010;
 
 const EVENT_QUIT: u32 = 0x100;
 const EVENT_WINDOW: u32 = 0x200;
+/// SDL_APP_WILLENTERBACKGROUND .. SDL_APP_DIDENTERFOREGROUND. webOS sends them when another app
+/// (Home, an input switch) takes the screen and when ours gets it back; window focus events alone
+/// also fire for system overlays that leave the app running.
+const EVENT_APP_WILL_BACKGROUND: u32 = 0x103;
+const EVENT_APP_DID_BACKGROUND: u32 = 0x104;
+const EVENT_APP_WILL_FOREGROUND: u32 = 0x105;
+const EVENT_APP_DID_FOREGROUND: u32 = 0x106;
 const EVENT_KEYDOWN: u32 = 0x300;
 const EVENT_KEYUP: u32 = 0x301;
 const EVENT_TEXTINPUT: u32 = 0x303;
@@ -480,6 +487,9 @@ pub enum InputEvent {
     Quit,
     FocusGained,
     FocusLost,
+    /// Another app has the screen; both the will- and did- edges arrive, in no promised order.
+    Background,
+    Foreground,
     Key { scancode: i32, keycode: i32, modifiers: u16, pressed: bool, repeat: bool },
     /// Committed text: the TV's on-screen keyboard, or a desktop keyboard in the simulator.
     Text(TextChunk),
@@ -558,6 +568,8 @@ fn decode(raw: &Event) -> Option<InputEvent> {
     let i16_at = |o: usize| i16::from_ne_bytes([b[o], b[o + 1]]);
     match kind {
         EVENT_QUIT => Some(InputEvent::Quit),
+        EVENT_APP_WILL_BACKGROUND | EVENT_APP_DID_BACKGROUND => Some(InputEvent::Background),
+        EVENT_APP_WILL_FOREGROUND | EVENT_APP_DID_FOREGROUND => Some(InputEvent::Foreground),
         EVENT_WINDOW => match b[12] {
             WINDOWEVENT_FOCUS_GAINED => Some(InputEvent::FocusGained),
             WINDOWEVENT_FOCUS_LOST => Some(InputEvent::FocusLost),

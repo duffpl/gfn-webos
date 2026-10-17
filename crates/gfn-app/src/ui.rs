@@ -2,7 +2,7 @@
 //! move through it, and when a frame needs drawing at all (the TV's graphics plane sits over the
 //! video, so an idle stream must not repaint it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -20,7 +20,7 @@ use crate::bluetooth::{self, Command, Status};
 use crate::gfx::{Align, CANVAS_H, CANVAS_W, Painter, Rect, Rgba};
 use crate::session::{self, Profile, Stats, Takeover};
 use crate::settings::{self, StreamSettings};
-use crate::{TV, Update};
+use crate::{TV, Update, Updates};
 
 const BACKGROUND: Rgba = [14, 15, 18, 255];
 const PANEL: Rgba = [30, 32, 38, 255];
@@ -42,6 +42,11 @@ const TILE_RADIUS: f32 = 12.0;
 const ROW_H: f32 = TILE_H + 84.0;
 const GRID_TOP: f32 = 180.0;
 const GRID_BOTTOM: f32 = 990.0;
+/// Artwork textures kept before those far from the viewport are dropped (about 300 KB each at
+/// 1080p); dropped ones reload from the core's disk cache when scrolled back into view.
+const ART_KEPT: usize = 96;
+/// Rows either side of the visible ones whose artwork survives eviction.
+const ART_MARGIN_ROWS: usize = 3;
 
 const HINT_FOR: Duration = Duration::from_secs(6);
 
@@ -150,6 +155,8 @@ struct Library {
     scroll: f32,
     art: HashMap<String, Art>,
     pending: HashMap<String, art::Pixels>,
+    /// The artwork last reported to the artwork thread as on screen.
+    on_screen: HashSet<String>,
 }
 
 pub struct App {
@@ -161,7 +168,7 @@ pub struct App {
     scope: Value,
     user: String,
     runtime: MediaRuntime,
-    updates: Sender<Update>,
+    updates: Updates,
     art: Sender<art::Message>,
     session: Option<session::Handle>,
     bluetooth: bluetooth::Handle,
@@ -179,6 +186,7 @@ pub struct App {
     keyboard: Option<Keyboard>,
     /// A short message over the stream, until the instant.
     notice: Option<(String, Instant)>,
+    last_render: Instant,
     dirty: bool,
     quitting: bool,
     exit: bool,
@@ -194,7 +202,7 @@ impl App {
     pub fn new(
         painter: Painter,
         runtime: MediaRuntime,
-        updates: Sender<Update>,
+        updates: Updates,
         art: Sender<art::Message>,
         bluetooth: bluetooth::Handle,
         (stream_settings, settings_path): (StreamSettings, PathBuf),
@@ -203,7 +211,7 @@ impl App {
             painter,
             screen: Screen::Starting("Starting".into()),
             menu: None,
-            library: Library { games: Vec::new(), focus: 0, header: false, header_focus: 0, scroll: 0.0, art: HashMap::new(), pending: HashMap::new() },
+            library: Library { games: Vec::new(), focus: 0, header: false, header_focus: 0, scroll: 0.0, art: HashMap::new(), pending: HashMap::new(), on_screen: HashSet::new() },
             core: None,
             scope: Value::Null,
             user: String::new(),
@@ -223,6 +231,7 @@ impl App {
             stats: None,
             keyboard: None,
             notice: None,
+            last_render: Instant::now(),
             dirty: true,
             quitting: false,
             exit: false,
@@ -422,8 +431,16 @@ impl App {
                 self.takeover = Some(reply);
                 self.menu = Some(conflict_menu(&running, &wanted));
             }
-            Progress::Profile(profile) => self.profile = Some(profile),
-            Progress::Stats(stats) => self.stats = Some(stats),
+            Progress::Profile(profile) => {
+                if let Some((width, height)) = profile.resolution.split_once('x') {
+                    if let (Ok(width), Ok(height)) = (width.parse(), height.parse()) {
+                        input.set_stream_size(width, height);
+                    }
+                }
+                self.profile = Some(profile);
+            }
+            // update() takes stats first, so they do not repaint the screen.
+            Progress::Stats(_) => {}
             Progress::Started => {
                 self.bluetooth.send(Command::Streaming(true));
                 self.screen = Screen::Streaming { first_frame: false, hint_until: Instant::now() + HINT_FOR };
@@ -781,6 +798,7 @@ impl App {
     }
 
     fn click(&mut self) {
+        self.dirty = true;
         let (x, y) = self.mouse;
         if let Some(menu) = &self.menu {
             if let Some(index) = self.menu_buttons().iter().position(|r| r.contains(x, y)) {
@@ -798,7 +816,14 @@ impl App {
         if matches!(self.screen, Screen::Settings) {
             if let Some(index) = (0..SettingRow::ALL.len()).find(|&i| settings_row_rect(i).contains(x, y)) {
                 self.settings_focus = index;
-                self.settings_nav(Nav::Select);
+                let (left, right) = settings_arrow_rects(index);
+                self.settings_nav(if left.contains(x, y) {
+                    Nav::Left
+                } else if right.contains(x, y) {
+                    Nav::Right
+                } else {
+                    Nav::Select
+                });
             }
             return;
         }
@@ -823,9 +848,12 @@ impl App {
         let mut moving = matches!(self.screen, Screen::Starting(_) | Screen::Launching { .. } | Screen::Ending(_));
         moving |= matches!(self.screen, Screen::Controllers) && self.controllers_busy();
         if let Screen::Streaming { hint_until, .. } = self.screen {
-            // One more frame once the hint expires, to take it off the screen.
-            moving |= Instant::now() < hint_until + Duration::from_millis(100);
-            moving |= self.notice.as_ref().is_some_and(|(_, until)| Instant::now() < *until + Duration::from_millis(100));
+            // The hint and notice are static: one repaint to show them (via dirty) and one when
+            // they expire, rather than recompositing the plane over the video every frame.
+            let now = Instant::now();
+            let expired_unseen = |until: Instant| now >= until && self.last_render < until;
+            moving |= expired_unseen(hint_until);
+            moving |= self.notice.as_ref().is_some_and(|(_, until)| expired_unseen(*until));
         }
         if matches!(self.screen, Screen::Library) && !self.library.games.is_empty() {
             let row = (self.library.focus / COLUMNS) as f32;
@@ -857,6 +885,7 @@ impl App {
             return false;
         }
         self.dirty = false;
+        self.last_render = Instant::now();
         self.painter.begin(window);
         match self.screen {
             Screen::Streaming { .. } if video => window.draw_video(),
@@ -1007,6 +1036,15 @@ impl App {
         let first_row = (self.library.scroll / ROW_H).floor().max(0.0) as usize;
         let rows = ((GRID_BOTTOM - GRID_TOP) / ROW_H).ceil() as usize + 2;
         let visible = first_row * COLUMNS..((first_row + rows) * COLUMNS).min(self.library.games.len());
+        let on_screen: HashSet<String> =
+            self.library.games[visible.start.min(visible.end)..visible.end].iter().filter_map(|g| g.art.clone()).collect();
+        if on_screen != self.library.on_screen {
+            // Requests for tiles scrolled past are dropped by the artwork thread; forgetting them
+            // here makes them ask again if they come back into view.
+            self.library.art.retain(|url, art| !matches!(art, Art::Requested) || on_screen.contains(url));
+            let _ = self.art.send(art::Message::Visible(on_screen.clone()));
+            self.library.on_screen = on_screen;
+        }
         let clip = self.painter.area(Rect::new(0.0, GRID_TOP - 24.0, CANVAS_W, GRID_BOTTOM - GRID_TOP + 24.0));
         window.clip(Some(clip));
         for index in visible {
@@ -1043,6 +1081,18 @@ impl App {
             p.text(window, &title, rect.x, rect.y + TILE_H + 18.0, 26.0, if focused { TEXT } else { DIM }, focused, Align::Left);
         }
         window.clip(None);
+        self.evict_far_art(first_row, rows);
+    }
+
+    fn evict_far_art(&mut self, first_row: usize, rows: usize) {
+        let ready = self.library.art.values().filter(|art| matches!(art, Art::Ready(_))).count();
+        if ready <= ART_KEPT {
+            return;
+        }
+        let start = first_row.saturating_sub(ART_MARGIN_ROWS) * COLUMNS;
+        let end = ((first_row + rows + ART_MARGIN_ROWS) * COLUMNS).min(self.library.games.len());
+        let near: HashSet<&str> = self.library.games[start.min(end)..end].iter().filter_map(|g| g.art.as_deref()).collect();
+        self.library.art.retain(|url, art| !matches!(art, Art::Ready(_)) || near.contains(url.as_str()));
     }
 
     fn draw_stats(&mut self, window: &mut Window) {
@@ -1427,6 +1477,18 @@ fn settings_row_rect(index: usize) -> Rect {
     Rect::new(MARGIN, SETTINGS_TOP + index as f32 * 100.0, SETTINGS_W, 84.0)
 }
 
+fn settings_value_x(row: Rect) -> f32 {
+    row.x + row.w - 200.0
+}
+
+/// Click targets for the ‹ and › drawn either side of the value, wider than the glyphs.
+fn settings_arrow_rects(index: usize) -> (Rect, Rect) {
+    let row = settings_row_rect(index);
+    let value_x = settings_value_x(row);
+    let target = |centre: f32| Rect::new(centre - 50.0, row.y, 100.0, row.h);
+    (target(value_x - 150.0), target(value_x + 150.0))
+}
+
 impl App {
     fn setting_value(&self, row: SettingRow) -> String {
         let s = &self.stream_settings;
@@ -1518,7 +1580,7 @@ impl App {
             }
             p.round_rect(window, rect, 14.0, if focused { BUTTON } else { PANEL });
             p.text(window, row.label(), rect.x + 32.0, rect.y + 24.0, 30.0, TEXT, true, Align::Left);
-            let value_x = rect.x + rect.w - 200.0;
+            let value_x = settings_value_x(rect);
             if focused {
                 p.text(window, "‹", value_x - 150.0, rect.y + 20.0, 34.0, ACCENT, true, Align::Center);
                 p.text(window, "›", value_x + 150.0, rect.y + 20.0, 34.0, ACCENT, true, Align::Center);
