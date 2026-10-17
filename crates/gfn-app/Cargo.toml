@@ -25,4 +25,6 @@ libc = "0.2"
 opennow-streamer-core = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-core", default-features = false, features = ["webos-platform"] }
 opennow-streamer-protocol = { path = "../../vendor/OpenNOW/native/opennow-streamer/crates/opennow-streamer-protocol" }
 qrcodegen = "1.8"
+# Only for the bundled icons, so no text, fonts or embedded images.
+resvg = { version = "0.48", default-features = false }
 serde_json = "1"

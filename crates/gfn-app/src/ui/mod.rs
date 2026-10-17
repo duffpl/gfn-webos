@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::account::{self, Game};
 use crate::art;
 use crate::bluetooth::{self, Command, Status};
-use crate::gfx::{Align, CANVAS_H, CANVAS_W, Painter, Rect, Rgba};
+use crate::gfx::{Align, CANVAS_H, CANVAS_W, Icon, Painter, Rect, Rgba};
 use crate::session::{self, Profile, Stats, Takeover};
 use crate::settings::{self, StreamSettings};
 use crate::{TV, Update, Updates};
@@ -103,6 +103,7 @@ enum Action {
     EndSession,
     Takeover(Takeover),
     Bluetooth(Command),
+    SignOut,
     Exit,
 }
 
@@ -141,6 +142,7 @@ pub struct App {
     core: Option<Arc<CoreClient>>,
     scope: Value,
     user: String,
+    sign_out: Option<Sender<()>>,
     runtime: MediaRuntime,
     updates: Updates,
     art: Sender<art::Message>,
@@ -190,6 +192,7 @@ impl App {
             core: None,
             scope: Value::Null,
             user: String::new(),
+            sign_out: None,
             runtime,
             updates,
             art,
@@ -272,6 +275,10 @@ impl App {
             "controllers" => self.open_controllers(),
             "settings" => self.screen = Screen::Settings,
             "library" => self.preview_library(false),
+            "signout" => {
+                self.preview_library(false);
+                self.menu = Some(sign_out_menu(&self.user));
+            }
             "genres" => self.preview_library(true),
             "detail" => self.preview_detail(false),
             "viewer" => self.preview_detail(true),
@@ -362,10 +369,11 @@ impl App {
                 let qr = crate::qr::pixels(if uri_complete.is_empty() { &uri } else { &uri_complete });
                 self.screen = Screen::SignIn { code, uri, qr, texture: None };
             }
-            account::Progress::SignedIn { core, user, scope } => {
+            account::Progress::SignedIn { core, user, scope, sign_out } => {
                 self.core = Some(core);
                 self.user = user;
                 self.scope = scope;
+                self.sign_out = Some(sign_out);
                 self.screen = Screen::Starting("Loading your library".into());
             }
             account::Progress::Library(games) => {
@@ -676,6 +684,16 @@ impl App {
                 }
             }
             Action::Bluetooth(command) => self.bluetooth.send(command),
+            Action::SignOut => {
+                if let Some(sign_out) = self.sign_out.take()
+                    && sign_out.send(()).is_ok()
+                {
+                    (self.core, self.scope) = (None, Value::Null);
+                    self.user.clear();
+                    self.library.clear();
+                    self.screen = Screen::Starting("Signing out".into());
+                }
+            }
             Action::Exit => self.request_quit(),
         }
     }
@@ -1244,7 +1262,7 @@ impl SettingRow {
             Self::Resolution => "The picture size the server streams. 1440p and 4K need a membership that includes them; otherwise the server picks the closest size it allows.",
             Self::FrameRate => "Frames per second. 120 fps depends on your membership and the game; the server falls back to what it allows.",
             Self::Bitrate => "The most data the stream may use. Higher is sharper but needs a steadier network; on Wi-Fi, 20 Mbps or less avoids stutter.",
-            Self::Codec => "H.265 gives a sharper picture at the same bitrate. H.264 may respond a few milliseconds faster.",
+            Self::Codec => "H.265 gives a sharper picture at the same bitrate; AV1 sharper still, on TVs from 2020 on. H.264 may respond a few milliseconds faster. This version does not check which codecs your TV decodes: if a stream does not start, choose another.",
             Self::Hdr => "Streams HDR10 when the game and your membership support it, and needs H.265 (turning it on selects it). Experimental on this TV.",
             Self::Player => "Starfish is the TV's media player. NDL feeds the decoder directly and may respond faster, but plays only H.264 without HDR (choosing it selects H.264). Experimental.",
         }
@@ -1392,6 +1410,16 @@ fn conflict_menu(running: &str, wanted: &str) -> Menu {
             ("Cancel".into(), Action::Takeover(Takeover::Cancel)),
         ],
         Action::Takeover(Takeover::Cancel),
+    )
+}
+
+fn sign_out_menu(user: &str) -> Menu {
+    let who = if user.is_empty() { String::new() } else { format!("You're signed in as {user}. ") };
+    Menu::new(
+        "Sign out?",
+        format!("{who}To play again, you'll sign in with a code on your phone, with this or another account."),
+        vec![("Sign out".into(), Action::SignOut), ("Cancel".into(), Action::CloseMenu)],
+        Action::CloseMenu,
     )
 }
 

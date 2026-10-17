@@ -29,6 +29,7 @@ pub struct LoadPayload {
 pub enum VideoCodec {
     H264,
     H265,
+    Av1,
 }
 
 impl VideoCodec {
@@ -36,6 +37,8 @@ impl VideoCodec {
         match self {
             Self::H264 => "H264",
             Self::H265 => "H265",
+            // As moonlight-tv's Starfish player names it (ss4s smp_video.c); not yet seen on a TV.
+            Self::Av1 => "AV1",
         }
     }
 }

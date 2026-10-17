@@ -413,7 +413,8 @@ fn backend(audio: Option<Arc<AudioOut>>) -> (SinkBackend, Option<Frames>) {
         }
         starfish(config)
     });
-    let codecs = vec![gfn_sink::MediaVideoCodec::H264, gfn_sink::MediaVideoCodec::H265];
+    // AV1 is claimed on every TV, as the Settings screen warns: older decoders refuse it at Load.
+    let codecs = vec![gfn_sink::MediaVideoCodec::H264, gfn_sink::MediaVideoCodec::H265, gfn_sink::MediaVideoCodec::Av1];
     // The C9 panel is HDR10; the player takes HDR from the stream's own VUI and SEI.
     let backend = SinkBackend::new("starfish", "webos", codecs, decoder, audio).with_hdr(vec![gfn_sink::MediaVideoCodec::H265]);
     (backend, None)

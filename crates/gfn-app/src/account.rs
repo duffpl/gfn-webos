@@ -87,7 +87,8 @@ impl Game {
 pub enum Progress {
     Starting(String),
     SignIn { code: String, uri: String, uri_complete: String },
-    SignedIn { core: Arc<CoreClient>, user: String, scope: Value },
+    /// A message on `sign_out` signs this account out and starts a new sign-in.
+    SignedIn { core: Arc<CoreClient>, user: String, scope: Value, sign_out: Sender<()> },
     Library(Vec<Game>),
     /// Genre code to display name, once known.
     Genres(HashMap<String, String>),
@@ -141,21 +142,31 @@ fn run(
     let call = |method: &str, params: Value, secs: u64| {
         core.request(method, params, Duration::from_secs(secs)).map_err(|e| format!("{method}: {e}"))
     };
-    let session = signed_in_session(&call, quit, send)?;
-    let scope = json!({
-        "generation": session["generation"],
-        "userId": session["session"]["user"]["userId"],
-        "providerIdpId": session["session"]["provider"]["idpId"],
-    });
-    let user = session["session"]["user"]["displayName"].as_str().unwrap_or("").to_owned();
-    send(Progress::SignedIn { core: Arc::clone(&core), user, scope });
-    send(Progress::Library(library(&call)?));
-    // Codes stand in for names until (or unless) these arrive.
-    match call("catalog.definitions.get", json!({}), 30) {
-        Ok(definitions) => send(Progress::Genres(genre_names(&definitions))),
-        Err(error) => eprintln!("genre names: {error}"),
+    loop {
+        let session = signed_in_session(&call, quit, send)?;
+        let scope = json!({
+            "generation": session["generation"],
+            "userId": session["session"]["user"]["userId"],
+            "providerIdpId": session["session"]["provider"]["idpId"],
+        });
+        let user = session["session"]["user"]["displayName"].as_str().unwrap_or("").to_owned();
+        let (sign_out, sign_outs) = std::sync::mpsc::channel();
+        send(Progress::SignedIn { core: Arc::clone(&core), user, scope, sign_out });
+        send(Progress::Library(library(&call)?));
+        // Codes stand in for names until (or unless) these arrive.
+        match call("catalog.definitions.get", json!({}), 30) {
+            Ok(definitions) => send(Progress::Genres(genre_names(&definitions))),
+            Err(error) => eprintln!("genre names: {error}"),
+        }
+        // The UI holds the only sender, so this ends when the app does.
+        if sign_outs.recv().is_err() {
+            return Ok(());
+        }
+        send(Progress::Starting("Signing out".into()));
+        // All saved accounts, not just this one: plain logout switches to another saved
+        // account instead of asking for a new sign-in.
+        call("auth.accounts.logoutAll", json!({}), 30)?;
     }
-    Ok(())
 }
 
 fn forward_events(events: Receiver<CoreEvent>, art: Sender<art::Message>) {

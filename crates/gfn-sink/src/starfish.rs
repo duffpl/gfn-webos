@@ -158,7 +158,7 @@ pub fn decoder_factory(app_id: String, display: Rect) -> Arc<DecoderFactory> {
         let codec = match config.codec {
             MediaVideoCodec::H264 => VideoCodec::H264,
             MediaVideoCodec::H265 => VideoCodec::H265,
-            MediaVideoCodec::Av1 => return Err("AV1 has no Starfish path".into()),
+            MediaVideoCodec::Av1 => VideoCodec::Av1,
         };
         let video = StarfishVideo::open(OpenConfig {
             app_id: app_id.clone(),

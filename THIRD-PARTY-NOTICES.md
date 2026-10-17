@@ -31,3 +31,9 @@ content type and arrival-time PTS also come from ss4s.
 ## Inter — SIL Open Font License 1.1
 
 `assets/fonts/Inter-*.ttf`. See `assets/fonts/OFL.txt`.
+
+## Icons — Streamline
+
+`assets/icons/cog.svg` is "Cog" from Streamline's free Core set, licensed CC BY 4.0
+([streamlinehq.com](https://streamlinehq.com)). `assets/icons/controller.svg` is "Game Controller"
+from Streamline's Ionic set, which redistributes [Ionicons](https://ionic.io/ionicons) (MIT).

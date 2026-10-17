@@ -141,6 +141,23 @@ pub struct Painter {
     /// Anti-aliased discs by pixel radius; rounded rectangles draw their quadrants as corners.
     discs: HashMap<u32, Texture>,
     fades: HashMap<Fade, Texture>,
+    /// By pixel size; `None` when the icon failed to render, so it is not tried every frame.
+    icons: HashMap<(Icon, u32), Option<Texture>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Icon {
+    Cog,
+    Controller,
+}
+
+impl Icon {
+    fn svg(self) -> &'static [u8] {
+        match self {
+            Icon::Cog => include_bytes!("../../../assets/icons/cog.svg"),
+            Icon::Controller => include_bytes!("../../../assets/icons/controller.svg"),
+        }
+    }
 }
 
 /// The way a [`Painter::fade`] runs out: towards the right, the top or the bottom.
@@ -153,7 +170,7 @@ pub enum Fade {
 
 impl Painter {
     pub fn new(fonts: Fonts) -> Self {
-        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), text_bytes: 0, discs: HashMap::new(), fades: HashMap::new() }
+        Self { fonts, scale: 1.0, offset: (0.0, 0.0), frame: 0, text: HashMap::new(), text_bytes: 0, discs: HashMap::new(), fades: HashMap::new(), icons: HashMap::new() }
     }
 
     /// Call before drawing a frame: picks up the current output size and evicts stale text.
@@ -270,6 +287,19 @@ impl Painter {
         window.draw(&self.fades[&fade], None, area, color);
     }
 
+    /// `icon` in `color`, `size` units square and centred on (`cx`, `cy`).
+    pub fn icon(&mut self, window: &mut Window, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgba) {
+        let area = self.area(Rect::new(cx - size / 2.0, cy - size / 2.0, size, size));
+        let pixels = area.w.max(1) as u32;
+        let texture = self.icons.entry((icon, pixels)).or_insert_with(|| {
+            let rgba = icon_pixels(icon.svg(), pixels)?;
+            window.texture(pixels, pixels, &rgba).ok()
+        });
+        if let Some(texture) = texture {
+            window.draw(texture, None, area, color);
+        }
+    }
+
     pub fn image(&mut self, window: &mut Window, texture: &Texture, r: Rect, alpha: u8) {
         window.draw(texture, None, self.area(r), [255, 255, 255, alpha]);
     }
@@ -382,6 +412,19 @@ fn fade_pixels(rising: bool) -> Vec<u8> {
             [255, 255, 255, if rising { alpha } else { 255 - alpha }]
         })
         .collect()
+}
+
+/// The SVG's shape in white, its coverage in alpha, so drawing tints it; fitted to a `size` pixel
+/// square.
+fn icon_pixels(svg: &[u8], size: u32) -> Option<Vec<u8>> {
+    use resvg::{tiny_skia, usvg};
+    let tree = usvg::Tree::from_data(svg, &usvg::Options::default()).map_err(|error| eprintln!("icon: {error}")).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
+    let view = tree.size();
+    let scale = size as f32 / view.width().max(view.height());
+    let (dx, dy) = ((size as f32 - view.width() * scale) / 2.0, (size as f32 - view.height() * scale) / 2.0);
+    resvg::render(&tree, tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy), &mut pixmap.as_mut());
+    Some(pixmap.pixels().iter().flat_map(|pixel| [255, 255, 255, pixel.alpha()]).collect())
 }
 
 /// White disc of `radius` pixels with a one-pixel anti-aliased edge.

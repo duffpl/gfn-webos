@@ -49,6 +49,8 @@ fn starts_access_unit(codec: VideoCodec, nal: &[u8]) -> bool {
                 _ => false,
             }
         }
+        // AV1 has no NAL units; the probe only reads .h264 and .h265 files.
+        VideoCodec::Av1 => unreachable!("AV1 is not Annex B"),
     }
 }
 
@@ -61,6 +63,7 @@ pub fn access_units(codec: VideoCodec, data: &[u8]) -> Vec<&[u8]> {
         let vcl = match codec {
             VideoCodec::H264 => matches!(nal.first().map(|h| h & 0x1f), Some(1 | 5)),
             VideoCodec::H265 => nal.first().is_some_and(|h| (h >> 1) & 0x3f <= 31),
+            VideoCodec::Av1 => unreachable!("AV1 is not Annex B"),
         };
         if has_vcl && starts_access_unit(codec, nal) {
             if let Some(start) = current {

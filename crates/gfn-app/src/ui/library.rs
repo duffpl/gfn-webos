@@ -28,9 +28,10 @@ const ART_MARGIN_ROWS: usize = 3;
 pub(super) enum Header {
     Settings,
     Controllers,
+    Account,
 }
 
-const HEADER_BUTTONS: [Header; 2] = [Header::Settings, Header::Controllers];
+const HEADER_BUTTONS: [Header; 3] = [Header::Settings, Header::Controllers, Header::Account];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -124,6 +125,16 @@ impl Library {
         self.detail = None;
         self.view.clear();
         self.refresh();
+    }
+
+    /// Forgets the signed-out account's games and the search over them; artwork stays cached by
+    /// URL.
+    pub(super) fn clear(&mut self) {
+        self.query.clear();
+        self.genre = None;
+        self.genre_menu = None;
+        (self.focus, self.selected, self.scroll) = (Focus::Grid, 0, 0.0);
+        self.set_games(Vec::new());
     }
 
     pub(super) fn set_genre_names(&mut self, names: HashMap<String, String>) {
@@ -406,21 +417,24 @@ impl App {
         Rect::new(MARGIN + col as f32 * (TILE_W + gap), GRID_TOP + row as f32 * ROW_H - self.library.scroll, TILE_W, TILE_H)
     }
 
-    /// Left to right, ending beside the user's name.
+    /// Left to right, ending with the user's name.
     fn header_buttons(&self) -> Vec<(Rect, String, Header)> {
-        let mut right = CANVAS_W - MARGIN - self.painter.text_width(&self.user, 30.0, false) - 40.0;
+        let mut right = CANVAS_W - MARGIN;
         let mut buttons: Vec<_> = HEADER_BUTTONS
             .iter()
             .rev()
             .map(|&button| {
-                let label = match button {
-                    Header::Settings => "Settings".to_owned(),
-                    Header::Controllers => match self.controllers.connected() {
-                        0 => "Controllers".into(),
-                        n => format!("Controllers · {n} connected"),
-                    },
+                let label = match (button, self.controllers.connected()) {
+                    (Header::Account, _) if self.user.is_empty() => "Account".to_owned(),
+                    (Header::Account, _) => self.user.clone(),
+                    (Header::Controllers, n @ 1..) => n.to_string(),
+                    _ => String::new(),
                 };
-                let w = self.painter.text_width(&label, 28.0, true) + 64.0;
+                let w = match button {
+                    Header::Account => self.painter.text_width(&label, 28.0, true) + 64.0,
+                    _ if label.is_empty() => 60.0,
+                    _ => 60.0 + self.painter.text_width(&label, 28.0, true) + 24.0,
+                };
                 right -= w;
                 let rect = Rect::new(right, 58.0, w, 60.0);
                 right -= 20.0;
@@ -480,6 +494,7 @@ impl App {
                 self.screen = Screen::Settings;
             }
             Header::Controllers => self.open_controllers(),
+            Header::Account => self.menu = Some(sign_out_menu(&self.user)),
         }
         self.dirty = true;
     }
@@ -591,10 +606,14 @@ impl App {
         let menu_open = self.library.genre_menu.is_some();
         let p = &mut self.painter;
         p.text(window, "GeForce NOW", MARGIN, 64.0, 48.0, TEXT, true, Align::Left);
-        p.text(window, &self.user, CANVAS_W - MARGIN, 76.0, 30.0, DIM, false, Align::Right);
         footer(p, window, self.library.hint(typing));
-        for (index, (rect, label, _)) in header.into_iter().enumerate() {
-            button(p, window, rect, &label, self.library.focus == Focus::Header(index) && !menu_open);
+        for (index, (rect, label, kind)) in header.into_iter().enumerate() {
+            let focused = self.library.focus == Focus::Header(index) && !menu_open;
+            match kind {
+                Header::Settings => icon_button(p, window, rect, Icon::Cog, &label, focused),
+                Header::Controllers => icon_button(p, window, rect, Icon::Controller, &label, focused),
+                Header::Account => button(p, window, rect, &label, focused),
+            }
         }
         for (index, (rect, label)) in tools.into_iter().enumerate() {
             let focused = self.library.focus == Focus::Toolbar(index) && !menu_open;
@@ -747,6 +766,19 @@ pub(super) fn button(p: &mut Painter, window: &mut Window, rect: Rect, label: &s
     p.round_rect(window, rect, 30.0, if focused { ACCENT } else { BUTTON });
     let color = if focused { ON_ACCENT } else { TEXT };
     p.text(window, label, rect.x + rect.w / 2.0, rect.y + 14.0, 28.0, color, true, Align::Center);
+}
+
+/// A round button showing `icon`, widened to a pill when it has a `label` beside the icon.
+fn icon_button(p: &mut Painter, window: &mut Window, rect: Rect, icon: Icon, label: &str, focused: bool) {
+    if focused {
+        p.halo(window, rect, 30.0, 4.0, ACCENT);
+    }
+    p.round_rect(window, rect, 30.0, if focused { ACCENT } else { BUTTON });
+    let color = if focused { ON_ACCENT } else { TEXT };
+    p.icon(window, icon, rect.x + 30.0, rect.y + rect.h / 2.0, 32.0, color);
+    if !label.is_empty() {
+        p.text(window, label, rect.x + 56.0, rect.y + 14.0, 28.0, color, true, Align::Left);
+    }
 }
 
 /// An outlined "HDR" tag in the tile's top-right corner, over the artwork.

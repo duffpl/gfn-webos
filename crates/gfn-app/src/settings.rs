@@ -13,7 +13,8 @@ pub const RESOLUTIONS: [(&str, &str); 4] =
 pub const FRAME_RATES: [u32; 3] = [30, 60, 120];
 pub const BITRATES: [u32; 9] = [10, 15, 20, 25, 30, 40, 50, 60, 75];
 /// No "auto": the core starts an embedded stream with "auto" as H.264, which would hide H.265.
-pub const CODECS: [(&str, &str); 2] = [("h264", "H.264"), ("h265", "H.265")];
+/// Every codec is offered on every TV: what the decoder takes is not detected yet.
+pub const CODECS: [(&str, &str); 3] = [("h264", "H.264"), ("h265", "H.265"), ("av1", "AV1")];
 /// The TV's video paths: Starfish (media pipeline, H.264/H.265, HDR) or NDL (direct decoder,
 /// H.264 only), which moonlight-tv uses on webOS 4 for latency.
 pub const PLAYERS: [(&str, &str); 2] = [("starfish", "Starfish"), ("ndl", "NDL (H.264 only)")];
