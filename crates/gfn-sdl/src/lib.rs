@@ -86,6 +86,7 @@ unsafe extern "C" {
     fn SDL_Init(flags: u32) -> c_int;
     fn SDL_Quit();
     fn SDL_GetError() -> *const c_char;
+    fn SDL_SetHint(name: *const c_char, value: *const c_char) -> c_int;
     fn SDL_CreateWindow(title: *const c_char, x: c_int, y: c_int, w: c_int, h: c_int, flags: u32) -> *mut c_void;
     fn SDL_DestroyWindow(window: *mut c_void);
     fn SDL_CreateRenderer(window: *mut c_void, index: c_int, flags: u32) -> *mut c_void;
@@ -637,6 +638,13 @@ pub fn stop_text_input() {
 
 pub fn has_screen_keyboard() -> bool {
     unsafe { SDL_HasScreenKeyboardSupport() != 0 }
+}
+
+/// Some of LG's hints act only when set after the window exists: the video driver applies them
+/// from SDL_SetHint, and reads no environment for them later.
+pub fn set_hint(name: &str, value: &str) -> bool {
+    let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else { return false };
+    unsafe { SDL_SetHint(name.as_ptr(), value.as_ptr()) != 0 }
 }
 
 pub fn show_cursor(visible: bool) {

@@ -20,6 +20,7 @@ mod bluetooth;
 mod crash;
 mod gfx;
 mod qr;
+mod screensaver;
 mod session;
 mod settings;
 mod ui;
@@ -38,6 +39,9 @@ pub const TV: bool = cfg!(all(target_os = "linux", target_arch = "arm"));
 
 /// The main loop's sleep during a TV stream: the controller keepalive interval.
 const STREAM_WAIT_MS: u32 = 100;
+/// The Magic Remote's pointer hides after this long without motion; LG's SDL defaults to five
+/// minutes, which leaves it over the library while browsing with the arrow keys or a pad.
+const CURSOR_SLEEP_MS: &str = "3000";
 
 pub enum Update {
     Account(account::Progress),
@@ -185,6 +189,10 @@ fn run(args: &[String]) -> Result<(), String> {
     } else {
         gfn_sdl::Window::open(&sdl, "GeForce NOW (simulator)", 1280, 720, false, true)?
     };
+    if TV && !gfn_sdl::set_hint("SDL_WEBOS_CURSOR_SLEEP_TIME", CURSOR_SLEEP_MS) {
+        eprintln!("cursor sleep time not taken: {}", gfn_sdl::error());
+    }
+    let controller_use = screensaver::start(TV, app_id());
     let audio = match AudioOut::open(&sdl, 48_000, 2, 480) {
         Ok(audio) => Some(Arc::new(audio)),
         Err(error) => {
@@ -283,7 +291,14 @@ fn run(args: &[String]) -> Result<(), String> {
                     input.controller_disconnected(instance_id);
                     controllers.retain(|c| c.instance_id() != instance_id);
                 }
-                Some(event) => app.event(event, &mut input, &window),
+                Some(event) => {
+                    match event {
+                        InputEvent::ControllerButton { pressed, .. } => controller_use.button(pressed),
+                        InputEvent::ControllerAxis { value, .. } => controller_use.axis(value),
+                        _ => {}
+                    }
+                    app.event(event, &mut input, &window);
+                }
                 None => {}
             }
             next = gfn_sdl::poll_event();
@@ -296,9 +311,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 PadEvent::Removed { id } => input.controller_disconnected(id),
                 PadEvent::Button { id, button, pressed } => {
+                    controller_use.button(pressed);
                     app.event(InputEvent::ControllerButton { instance_id: id, button, pressed }, &mut input, &window);
                 }
                 PadEvent::Axis { id, axis, value } => {
+                    controller_use.axis(value);
                     app.event(InputEvent::ControllerAxis { instance_id: id, axis, value }, &mut input, &window);
                 }
             }
@@ -306,6 +323,7 @@ fn run(args: &[String]) -> Result<(), String> {
         while let Ok(update) = updates.try_recv() {
             app.update(update, &mut input);
         }
+        controller_use.streaming(app.is_streaming());
         if app.stream_has_input() {
             input.tick();
         }

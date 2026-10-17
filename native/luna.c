@@ -101,7 +101,7 @@ static int run_job(void *data) {
     if (job->uri) {
         LSMessageToken token = 0;
         /* ctx carries the id itself: nothing to free when a call is retired. ids fit uintptr_t
-         * because the Rust side counts up from 1 and never reaches 2^32 in one process. */
+         * because the Rust side keeps them below 2^32 (a 4-bit user, then a 28-bit count). */
         if (ls.Call(handle, job->uri, job->payload, reply, (void *)(uintptr_t)job->id, &token, &error)) {
             struct live *call = malloc(sizeof *call);
             if (call) {

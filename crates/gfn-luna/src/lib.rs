@@ -2,7 +2,7 @@
 //!
 //! Only the TV has a bus; elsewhere [`Bus::open`] fails and callers fall back or go without.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
@@ -15,24 +15,36 @@ pub struct Reply {
     pub payload: Value,
 }
 
+/// One user of the process's single bus connection, with its own reply channel.
 pub struct Bus {
-    next: AtomicU64,
+    sink: u64,
+    next: AtomicU32,
 }
 
-static REPLIES: OnceLock<Mutex<Sender<Reply>>> = OnceLock::new();
+/// Call ids carry their bus's sink in the top bits: native/luna.c passes ids through a 32-bit
+/// pointer, which leaves 2^28 calls per user.
+const SINK_SHIFT: u32 = 28;
+const MAX_SINKS: usize = 1 << (32 - SINK_SHIFT);
+
+static CONNECTED: OnceLock<Result<(), String>> = OnceLock::new();
+static SINKS: Mutex<Vec<Sender<Reply>>> = Mutex::new(Vec::new());
 
 impl Bus {
-    /// Connects anonymously; every reply from then on goes to `replies`. Once per process.
+    /// Connects anonymously on first use; replies to this bus's calls go to `replies`.
     pub fn open(replies: Sender<Reply>) -> Result<Self, String> {
-        REPLIES.set(Mutex::new(replies)).map_err(|_| "the bus is already open".to_owned())?;
-        sys::open()?;
-        Ok(Self { next: AtomicU64::new(1) })
+        CONNECTED.get_or_init(sys::open).clone()?;
+        let mut sinks = SINKS.lock().unwrap_or_else(|e| e.into_inner());
+        if sinks.len() == MAX_SINKS {
+            return Err("too many bus users".into());
+        }
+        sinks.push(replies);
+        Ok(Self { sink: (sinks.len() - 1) as u64, next: AtomicU32::new(1) })
     }
 
     /// `uri` is `luna://service/method`; add `"subscribe": true` to `payload` for a subscription.
     /// Replies keep coming until [`Bus::cancel`].
     pub fn call(&self, uri: &str, payload: &Value) -> u64 {
-        let call = self.next.fetch_add(1, Ordering::Relaxed);
+        let call = self.sink << SINK_SHIFT | u64::from(self.next.fetch_add(1, Ordering::Relaxed));
         sys::call(call, uri, &payload.to_string());
         call
     }
@@ -46,8 +58,9 @@ impl Bus {
 fn deliver(call: u64, payload: &str) {
     let payload = serde_json::from_str(payload)
         .unwrap_or_else(|_| serde_json::json!({ "returnValue": false, "errorText": format!("unparsable reply: {payload}") }));
-    if let Some(replies) = REPLIES.get() {
-        let _ = replies.lock().unwrap_or_else(|e| e.into_inner()).send(Reply { call, payload });
+    let sinks = SINKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(replies) = sinks.get((call >> SINK_SHIFT) as usize) {
+        let _ = replies.send(Reply { call, payload });
     }
 }
 
