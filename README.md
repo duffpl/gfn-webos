@@ -5,6 +5,13 @@ An unofficial, native GeForce NOW client for LG webOS TVs. Not affiliated with N
 It runs as a native app on the TV: no browser and no Chromium. It plays the stream through
 the TV's hardware decoder, and has a UI made for the remote and game controllers.
 
+![The library, filtered by genre](docs/screenshots/library.png)
+
+<p>
+  <img src="docs/screenshots/detail.png" alt="A game's details" width="49%">
+  <img src="docs/screenshots/signin.png" alt="Signing in with a code" width="49%">
+</p>
+
 ## What it is built on
 
 - **[OpenNOW](https://github.com/OpenCloudGaming/OpenNOW)** (MIT), through our fork
@@ -80,7 +87,8 @@ This repository adds the TV side:
   The app doesn't install anything itself.
 
 **Input**
-- Bluetooth controller pairing (Controllers screen). Paired pads are read directly from
+- Bluetooth controller pairing (Controllers screen). The C9's own settings can't pair a game
+  controller, so this is the way to connect one there. Paired pads are read directly from
   `/dev/input`.
 - Magic Remote as a mouse, scaled to the stream's resolution. The pointer hides when idle.
 - Colour keys:
@@ -110,7 +118,8 @@ These work on it:
 - The NDL video player with H.264. It feels about as responsive as Starfish.
   - Its stats show about 11 ms display lag. That number isn't comparable with Starfish's: NDL
     reports a different point in the pipeline, so it isn't evidence that NDL is faster.
-- Bluetooth pairing and play with a DualSense controller.
+- Bluetooth pairing and play with a DualSense controller, paired from the app's Controllers
+  screen (the TV's own Bluetooth menu doesn't offer game controllers).
 - The Magic Remote as a mouse at stream resolutions above 1080p.
 - The colour keys, the Back key and the stats overlay.
 - LG's on-screen keyboard: it opens, typing reaches the game, and closing it is detected.
@@ -222,6 +231,15 @@ cargo test -p gfn-app --features sim
 
 `--preview <screen>` shows a screen with sample data, without signing in. For example:
 `library`, `detail`, `viewer`, `settings`, `controllers`, `signin`, `queue` and `stats`.
+
+`--window WxH` sets the simulator's window size (1280x720 by default). The window draws at the
+display's full pixel density, so on a Retina screen it draws 2560x1440 pixels. With `--screenshot FILE.png`
+it sets the screenshot's size, which can be bigger than your screen. `1920x1080` shows exactly
+what the TV draws, and `3840x2160` draws it at twice the size:
+
+```sh
+gfn-app --preview library --window 1920x1080 --screenshot library.png
+```
 
 ### Building in Docker (Linux)
 

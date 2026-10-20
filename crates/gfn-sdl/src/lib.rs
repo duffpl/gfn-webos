@@ -14,6 +14,7 @@ pub const INIT_GAMECONTROLLER: u32 = 0x2000;
 
 const WINDOW_FULLSCREEN: u32 = 0x1;
 const WINDOW_RESIZABLE: u32 = 0x20;
+const WINDOW_ALLOW_HIGHDPI: u32 = 0x2000;
 const WINDOWPOS_CENTERED: c_int = 0x2FFF_0000;
 const RENDERER_ACCELERATED: u32 = 0x2;
 const RENDERER_PRESENTVSYNC: u32 = 0x4;
@@ -23,6 +24,7 @@ const PIXELFORMAT_RGBA32: u32 = 0x1676_2004;
 const TEXTUREACCESS_STATIC: c_int = 0;
 const BLENDMODE_BLEND: c_int = 1;
 const TEXTUREACCESS_STREAMING: c_int = 1;
+const TEXTUREACCESS_TARGET: c_int = 2;
 const AUDIO_S16LSB: u16 = 0x8010;
 
 const EVENT_QUIT: u32 = 0x100;
@@ -104,6 +106,7 @@ unsafe extern "C" {
     fn SDL_UpdateTexture(texture: *mut c_void, rect: *const Rect, pixels: *const c_void, pitch: c_int) -> c_int;
     fn SDL_CreateTexture(renderer: *mut c_void, format: u32, access: c_int, w: c_int, h: c_int) -> *mut c_void;
     fn SDL_DestroyTexture(texture: *mut c_void);
+    fn SDL_SetRenderTarget(renderer: *mut c_void, texture: *mut c_void) -> c_int;
     fn SDL_UpdateYUVTexture(
         texture: *mut c_void,
         rect: *const Rect,
@@ -242,6 +245,7 @@ pub struct Window {
     surface: Rc<Surface>,
     video: *mut c_void,
     video_size: (u32, u32),
+    offscreen: Option<Texture>,
 }
 
 impl Window {
@@ -249,7 +253,8 @@ impl Window {
     /// window draws itself, at the cost of up to one refresh of latency.
     pub fn open(_sdl: &Sdl, title: &str, width: u32, height: u32, fullscreen: bool, vsync: bool) -> Result<Self, String> {
         let title = CString::new(title).map_err(|_| "title contains NUL")?;
-        let flags = if fullscreen { WINDOW_FULLSCREEN } else { WINDOW_RESIZABLE };
+        // Only the desktop simulator is windowed; HiDPI gives it the display's full pixel density.
+        let flags = if fullscreen { WINDOW_FULLSCREEN } else { WINDOW_RESIZABLE | WINDOW_ALLOW_HIGHDPI };
         unsafe {
             let window = SDL_CreateWindow(
                 title.as_ptr(),
@@ -269,7 +274,7 @@ impl Window {
                 return Err(format!("SDL_CreateRenderer: {}", error()));
             }
             SDL_SetRenderDrawBlendMode(renderer, BLENDMODE_BLEND);
-            Ok(Self { surface: Rc::new(Surface { window, renderer }), video: std::ptr::null_mut(), video_size: (0, 0) })
+            Ok(Self { surface: Rc::new(Surface { window, renderer }), video: std::ptr::null_mut(), video_size: (0, 0), offscreen: None })
         }
     }
 
@@ -301,11 +306,33 @@ impl Window {
         (w.max(0) as u32, h.max(0) as u32)
     }
 
-    /// Size in drawing pixels (larger than [`Window::size`] on HiDPI displays).
+    /// Size in drawing pixels (larger than [`Window::size`] on HiDPI displays), or the off-screen
+    /// frame's.
     pub fn output_size(&self) -> (u32, u32) {
+        if let Some(target) = &self.offscreen {
+            return (target.width, target.height);
+        }
         let (mut w, mut h) = (0, 0);
         unsafe { SDL_GetRendererOutputSize(self.renderer(), &mut w, &mut h) };
         (w.max(0) as u32, h.max(0) as u32)
+    }
+
+    /// Draws every later frame into a `width` x `height` texture instead of the window, which then
+    /// shows nothing: for frames larger than the desktop lets a window be.
+    pub fn draw_offscreen(&mut self, width: u32, height: u32) -> Result<(), String> {
+        unsafe {
+            let texture =
+                SDL_CreateTexture(self.renderer(), PIXELFORMAT_RGBA32, TEXTUREACCESS_TARGET, width as c_int, height as c_int);
+            if texture.is_null() {
+                return Err(format!("SDL_CreateTexture: {}", error()));
+            }
+            let target = Texture { _surface: Rc::clone(&self.surface), texture, width, height };
+            if SDL_SetRenderTarget(self.renderer(), target.texture) != 0 {
+                return Err(format!("SDL_SetRenderTarget: {}", error()));
+            }
+            self.offscreen = Some(target);
+        }
+        Ok(())
     }
 
     /// Relative mode hides the pointer and reports raw motion; the grab keeps it in the window.

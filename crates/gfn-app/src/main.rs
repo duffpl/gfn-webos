@@ -2,9 +2,12 @@
 //!
 //!     gfn-app [--core PATH] [--data-dir DIR] [--codec C] [--max-bitrate MBPS] [--verbose]
 //!             [--screenshot FILE.png [--screenshot-after SECONDS]] [--preview SCREEN]
+//!             [--window WxH]
 //!
 //! `--screenshot` and `--preview` are developer aids: save one drawn frame and exit; show one
-//! screen with sample data and no core.
+//! screen with sample data and no core. `--window` sizes the simulator's window (1280x720 unless
+//! given); with `--screenshot` it is the screenshot's size, any size: 1920x1080 draws exactly
+//! what the TV does, 3840x2160 at twice that.
 //!
 //! On the TV the picture goes to the Starfish video plane beneath a transparent fullscreen
 //! window and the UI is drawn on that window; in the desktop simulator (`--features sim`) the
@@ -77,6 +80,14 @@ impl Updates {
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+/// The simulator's window; the TV's is always its 1920x1080 panel.
+fn window_size(args: &[String]) -> Result<Option<(u32, u32)>, String> {
+    let Some(text) = flag(args, "--window") else { return Ok(None) };
+    let size = text.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+    let size = size.filter(|&(w, h): &(u32, u32)| w > 0 && h > 0);
+    size.map(Some).ok_or_else(|| format!("--window {text}: expected WIDTHxHEIGHT, e.g. 1920x1080"))
 }
 
 fn config(args: &[String]) -> Result<account::Config, String> {
@@ -191,7 +202,14 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut window = if TV {
         gfn_sdl::Window::open(&sdl, "GeForce NOW", 1920, 1080, true, true)?
     } else {
-        gfn_sdl::Window::open(&sdl, "GeForce NOW (simulator)", 1280, 720, false, true)?
+        let size = window_size(args)?;
+        let (w, h) = size.unwrap_or((1280, 720));
+        let mut window = gfn_sdl::Window::open(&sdl, "GeForce NOW (simulator)", w, h, false, true)?;
+        // The desktop shrinks a window to fit the screen; a screenshot's frame need not fit.
+        if let Some((w, h)) = size.filter(|_| flag(args, "--screenshot").is_some()) {
+            window.draw_offscreen(w, h)?;
+        }
+        window
     };
     if TV && !gfn_sdl::set_hint("SDL_WEBOS_CURSOR_SLEEP_TIME", CURSOR_SLEEP_MS) {
         eprintln!("cursor sleep time not taken: {}", gfn_sdl::error());

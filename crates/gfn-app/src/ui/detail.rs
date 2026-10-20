@@ -551,8 +551,8 @@ impl App {
         footer(p, window, hint);
     }
 
-    /// Developer aid: Cyberpunk 2077's detail screen with the artwork downloaded into
-    /// `.claude/design/images` (not committed); without it the screen shows no pictures.
+    /// Developer aid: Cyberpunk 2077's detail screen, with its catalog text and the artwork downloaded
+    /// into `.claude/design/images` (not committed); without it the screen shows no pictures.
     pub(super) fn preview_detail(&mut self, viewer: bool) {
         self.preview_library(false);
         let images = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/design/images/cyberpunk-2077");
@@ -560,10 +560,8 @@ impl App {
         game.hero = Some(format!("{images}/marquee_hero_image.jpg"));
         game.screenshots = (1..=12).map(|i| format!("{images}/screenshots_{i:02}.jpg")).collect();
         game.description = Some(
-            "An open-world action role-playing game set in Night City, where you play a mercenary chasing an implant \
-             that could make you immortal. Shape your character with cyberware, skills and the choices you make, and \
-             find your own way through a city of gangs, corporations and neon. The world reacts to every decision, \
-             and each district hides its own stories."
+            "Cyberpunk 2077 is an open-world, action-adventure RPG set in the dark future of Night City — a dangerous \
+             megalopolis obsessed with power, glamor, and ceaseless body modification."
                 .into(),
         );
         game.rating = Some("PEGI 18".into());

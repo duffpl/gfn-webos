@@ -10,11 +10,15 @@ pub(super) const TILE_W: f32 = 240.0;
 pub(super) const TILE_H: f32 = 320.0;
 const TILE_RADIUS: f32 = 12.0;
 const ROW_H: f32 = TILE_H + 84.0;
-const TOOLBAR_Y: f32 = 150.0;
-const TOOLBAR_H: f32 = 60.0;
-const SEARCH_W: f32 = 520.0;
-const GRID_TOP: f32 = 260.0;
-const GRID_BOTTOM: f32 = 990.0;
+/// A row's tile and title, without the gap below them: two of these fit on screen, two
+/// [`ROW_H`] do not.
+const ROW_CONTENT_H: f32 = TILE_H + 56.0;
+const TOOLBAR_Y: f32 = 140.0;
+const TOOLBAR_H: f32 = 48.0;
+const TOOL_SIZE: f32 = 24.0;
+const SEARCH_W: f32 = 460.0;
+const GRID_TOP: f32 = 216.0;
+const GRID_BOTTOM: f32 = 1000.0;
 const GENRE_MENU_W: f32 = 520.0;
 const GENRE_ROW_H: f32 = 64.0;
 const GENRE_ROWS_SHOWN: usize = 10;
@@ -310,7 +314,7 @@ impl Library {
         }
         let row = (self.selected / COLUMNS) as f32;
         let visible = GRID_BOTTOM - GRID_TOP;
-        let (top, bottom) = (row * ROW_H, row * ROW_H + ROW_H);
+        let (top, bottom) = (row * ROW_H, row * ROW_H + ROW_CONTENT_H);
         let mut target = self.scroll;
         if top < target {
             target = top;
@@ -480,7 +484,7 @@ impl App {
         let mut buttons = vec![(Rect::new(MARGIN, TOOLBAR_Y, SEARCH_W, TOOLBAR_H), search)];
         let mut x = MARGIN + SEARCH_W + 20.0;
         for label in [format!("Genre: {genre}  ⌄"), format!("Sort: {sort}")] {
-            let w = self.painter.text_width(&label, 28.0, true) + 64.0;
+            let w = self.painter.text_width(&label, TOOL_SIZE, true) + 48.0;
             buttons.push((Rect::new(x, TOOLBAR_Y, w, TOOLBAR_H), label));
             x += w + 20.0;
         }
@@ -643,22 +647,24 @@ impl App {
         for (index, (rect, label)) in tools.into_iter().enumerate() {
             let focused = self.library.focus == Focus::Toolbar(index) && !menu_open;
             if TOOLS[index] != Tool::Search {
-                button(p, window, rect, &label, focused);
+                pill(p, window, rect, &label, focused, TOOL_SIZE);
                 continue;
             }
+            let radius = rect.h / 2.0;
             if focused {
-                p.halo(window, rect, 30.0, 4.0, ACCENT);
+                p.halo(window, rect, radius, 4.0, ACCENT);
             }
-            p.round_rect(window, rect, 30.0, if focused || typing { BUTTON } else { PANEL });
+            p.round_rect(window, rect, radius, if focused || typing { BUTTON } else { PANEL });
             let text = if typing { format!("{}|", self.library.query) } else { label };
-            let text = p.fit(&text, 28.0, false, rect.w - 64.0);
+            let text = p.fit(&text, TOOL_SIZE, false, rect.w - 48.0);
             let color = if self.library.query.is_empty() && !typing { DIM } else { TEXT };
-            p.text(window, &text, rect.x + 32.0, rect.y + 14.0, 28.0, color, false, Align::Left);
+            p.text(window, &text, rect.x + 24.0, text_top(rect, TOOL_SIZE), TOOL_SIZE, color, false, Align::Left);
         }
         let (shown, total) = (self.library.view.len(), self.library.games.len());
         if total > 0 {
             let count = if shown == total { format!("{total} games") } else { format!("{shown} of {total} games") };
-            p.text(window, &count, CANVAS_W - MARGIN, TOOLBAR_Y + 16.0, 26.0, DIM, false, Align::Right);
+            let bar = Rect::new(0.0, TOOLBAR_Y, 0.0, TOOLBAR_H);
+            p.text(window, &count, CANVAS_W - MARGIN, text_top(bar, TOOL_SIZE), TOOL_SIZE, DIM, false, Align::Right);
         }
         if total == 0 {
             p.text(window, "Your library is empty", CANVAS_W / 2.0, 440.0, 44.0, TEXT, true, Align::Center);
@@ -706,8 +712,24 @@ impl App {
             p.text(window, &title, rect.x, rect.y + TILE_H + 18.0, 26.0, if focused { TEXT } else { DIM }, focused, Align::Left);
         }
         window.clip(None);
+        self.draw_grid_scrollbar(window, shown);
         self.evict_far_art(first_row, rows);
         self.draw_genre_menu(window);
+    }
+
+    /// In the right margin, only when the grid is taller than the screen.
+    fn draw_grid_scrollbar(&mut self, window: &mut Window, shown: usize) {
+        let visible = GRID_BOTTOM - GRID_TOP;
+        let content = (shown.div_ceil(COLUMNS) - 1) as f32 * ROW_H + ROW_CONTENT_H;
+        if content <= visible {
+            return;
+        }
+        let track = Rect::new(CANVAS_W - MARGIN / 2.0 - 3.0, GRID_TOP, 6.0, visible);
+        let thumb_h = (visible / content * track.h).max(48.0);
+        let at = (self.library.scroll / (content - visible)).clamp(0.0, 1.0);
+        let p = &mut self.painter;
+        p.round_rect(window, track, 3.0, BUTTON);
+        p.round_rect(window, Rect::new(track.x, track.y + at * (track.h - thumb_h), track.w, thumb_h), 3.0, DIM);
     }
 
     fn draw_genre_menu(&mut self, window: &mut Window) {
@@ -745,13 +767,15 @@ impl App {
         self.library.art.retain(|url, art| !matches!(art, Art::Ready(_)) || near.contains(url.as_str()));
     }
 
-    /// Developer aid: the library with sample games and no core. Two covers come from
-    /// `.claude/design/images` (not committed); the rest show their titles.
+    /// Developer aid: the library with sample games and no core. The covers come from
+    /// `.claude/design/images/<folder>/game_box_art.jpg` (not committed); a game without one shows
+    /// its title.
     pub(super) fn preview_library(&mut self, genre_menu: bool) {
-        let sample = |title: &str, genres: &[&str], hdr: bool| Game {
+        let images = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/design/images");
+        let sample = |title: &str, folder: &str, genres: &[&str], hdr: bool| Game {
             app_id: Value::from(title),
             title: title.to_owned(),
-            art: None,
+            art: Some(format!("{images}/{folder}/game_box_art.jpg")),
             genres: genres.iter().map(|g| (*g).to_owned()).collect(),
             search_text: format!("{} {}", title, genres.join(" ")).to_lowercase(),
             variants: vec![account::Variant { id: "1".into(), store: "STEAM".into(), selected: true, in_library: true, hdr, ..Default::default() }],
@@ -759,22 +783,19 @@ impl App {
         };
         self.user = "Player One".into();
         self.library.set_games(vec![
-            sample("Cyberpunk 2077", &["ACTION", "RPG"], true),
-            sample("Fortnite", &["ACTION", "SHOOTER"], false),
-            sample("Baldur's Gate 3", &["RPG", "STRATEGY"], false),
-            sample("Forza Horizon 5", &["RACING"], true),
-            sample("Hades II", &["ACTION", "INDIE"], false),
-            sample("Against the Storm", &["STRATEGY", "INDIE"], false),
-            sample("Diablo® IV", &["ACTION", "RPG"], true),
-            sample("Teardown", &["ACTION", "INDIE"], false),
-            sample("Alan Wake 2", &["ACTION", "ADVENTURE"], true),
-            sample("Stardew Valley", &["SIMULATION", "INDIE"], false),
-            sample("Counter-Strike 2", &["SHOOTER"], false),
-            sample("Hollow Knight", &["ADVENTURE", "INDIE"], false),
+            sample("Cyberpunk 2077", "cyberpunk-2077", &["ACTION", "RPG"], true),
+            sample("Fortnite", "fortnite", &["ACTION", "SHOOTER"], false),
+            sample("Baldur's Gate 3", "baldurs-gate-3", &["RPG", "STRATEGY"], false),
+            sample("Forza Horizon 5", "forza-horizon-5", &["RACING"], true),
+            sample("Satisfactory", "satisfactory", &["SIMULATION", "INDIE"], false),
+            sample("Against the Storm", "against-the-storm", &["STRATEGY", "INDIE"], false),
+            sample("Diablo® IV", "diablo-iv", &["ACTION", "RPG"], true),
+            sample("Teardown", "teardown", &["ACTION", "INDIE"], false),
+            sample("Alan Wake 2", "alan-wake-2", &["ACTION", "ADVENTURE"], true),
+            sample("Stardew Valley", "stardew-valley", &["SIMULATION", "INDIE"], false),
+            sample("Counter-Strike 2", "counter-strike-2", &["SHOOTER"], false),
+            sample("Hollow Knight", "hollow-knight", &["ADVENTURE", "INDIE"], false),
         ]);
-        let images = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/design/images");
-        self.library.games[0].art = Some(format!("{images}/cyberpunk-2077/game_box_art.jpg"));
-        self.library.games[1].art = Some(format!("{images}/fortnite/game_box_art.jpg"));
         self.library.set_genre_names(HashMap::from([("RPG".to_owned(), "Role-Playing".to_owned())]));
         if genre_menu {
             self.library.focus = Focus::Toolbar(1);
@@ -785,12 +806,22 @@ impl App {
 }
 
 pub(super) fn button(p: &mut Painter, window: &mut Window, rect: Rect, label: &str, focused: bool) {
+    pill(p, window, rect, label, focused, 28.0);
+}
+
+fn pill(p: &mut Painter, window: &mut Window, rect: Rect, label: &str, focused: bool, size: f32) {
+    let radius = rect.h / 2.0;
     if focused {
-        p.halo(window, rect, 30.0, 4.0, ACCENT);
+        p.halo(window, rect, radius, 4.0, ACCENT);
     }
-    p.round_rect(window, rect, 30.0, if focused { ACCENT } else { BUTTON });
+    p.round_rect(window, rect, radius, if focused { ACCENT } else { BUTTON });
     let color = if focused { ON_ACCENT } else { TEXT };
-    p.text(window, label, rect.x + rect.w / 2.0, rect.y + 14.0, 28.0, color, true, Align::Center);
+    p.text(window, label, rect.x + rect.w / 2.0, text_top(rect, size), size, color, true, Align::Center);
+}
+
+/// The top of `size` text centred in `rect`'s height (14 for 28 in a 60 high button).
+fn text_top(rect: Rect, size: f32) -> f32 {
+    rect.y + (rect.h - size * 1.15) / 2.0
 }
 
 /// A round button showing `icon`, in `color` until focused, widened to a pill when it has a

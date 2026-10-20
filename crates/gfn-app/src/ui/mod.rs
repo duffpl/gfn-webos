@@ -235,8 +235,8 @@ impl App {
         match name {
             "signin" => self.account(account::Progress::SignIn {
                 code: "KX7P-Q2MD".into(),
-                uri: "nvidia.com/activate".into(),
-                uri_complete: "https://www.nvidia.com/activate?code=KX7P-Q2MD".into(),
+                uri: "https://static-login.nvidia.com/service/gfn/pin".into(),
+                uri_complete: "https://static-login.nvidia.com/service/gfn/pin?user_code=KX7P-Q2MD".into(),
             }),
             "queue" => {
                 self.screen = Screen::Launching { title: "Against the Storm".into(), status: String::new(), queue: Some(14) };
