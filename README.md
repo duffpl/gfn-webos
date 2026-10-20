@@ -173,10 +173,12 @@ The OpenNOW core can do these, but this app doesn't offer them yet:
 
 ## Getting the app
 
-There is no release download, and the app isn't in the
-[webOS Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel) repository at the
-moment. It may be proposed there once it has been tested on more TVs. Until then you build the
-`.ipk` yourself and install it in Developer Mode, as below.
+Download the `.ipk` from the [latest release](https://github.com/duffpl/gfn-webos/releases/latest)
+and install it in Developer Mode, as [below](#installing-on-a-tv), or [build](#building) it
+yourself.
+
+The app isn't in the [webOS Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel)
+repository at the moment. It may be proposed there once it has been tested on more TVs.
 
 ## Building
 
@@ -295,6 +297,9 @@ The app installs like any other Developer Mode app.
    ```sh
    GFN_TV=<tv-ip> scripts/tv-install.sh --launch
    ```
+
+   For a downloaded release, put its `.ipk` in `build/` first; the script installs the one whose
+   version matches `pkg/appinfo.json`.
 
    The script:
    - copies the `.ipk` over the TV's developer ssh (port 9922, user `prisoner`);

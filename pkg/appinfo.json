@@ -1,6 +1,6 @@
 {
   "id": "io.github.gfnwebos",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "vendor": "gfn-webos",
   "type": "native",
   "main": "gfn-app",
